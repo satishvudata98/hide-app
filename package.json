@@ -1,0 +1,57 @@
+{
+  "name": "windows-capture-excluded-overlay",
+  "version": "1.0.0",
+  "description": "Minimal Electron overlay for Windows that stays visible locally while requesting capture exclusion via SetWindowDisplayAffinity.",
+  "productName": "InvisibleOverlay",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win portable",
+    "dist:installer": "electron-builder --win nsis"
+  },
+  "keywords": [
+    "electron",
+    "overlay",
+    "windows",
+    "screen-capture",
+    "ffi"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "optionalDependencies": {
+    "ffi-napi": "^4.0.3",
+    "ref-napi": "^3.0.3"
+  },
+  "build": {
+    "appId": "com.vsatish.invisibleoverlay",
+    "productName": "InvisibleOverlay",
+    "asar": true,
+    "npmRebuild": false,
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}-portable.${ext}"
+    }
+  }
+}
