@@ -5,7 +5,10 @@
   "productName": "InvisibleOverlay",
   "main": "main.js",
   "scripts": {
+    "dev": "vite",
+    "build": "vite build",
     "start": "electron .",
+    "start:dev": "set VITE_DEV_SERVER_URL=http://localhost:5173&& electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win portable",
     "dist:installer": "electron-builder --win nsis"
@@ -20,8 +23,11 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.6",
     "electron": "^30.0.0",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "^26.0.12",
+    "vite": "^8.0.8",
+    "vue": "^3.5.32"
   },
   "optionalDependencies": {
     "ffi-napi": "^4.0.3",
@@ -35,7 +41,7 @@
     "files": [
       "main.js",
       "preload.js",
-      "index.html",
+      "dist-vue/**/*",
       "package.json"
     ],
     "directories": {

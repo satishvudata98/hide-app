@@ -24,24 +24,24 @@ try {
 const isWindows = process.platform === 'win32';
 const WDA_EXCLUDEFROMCAPTURE = 0x00000011;
 const OPACITY_STEP = 0.1;
-const MIN_OPACITY = 0.65;
+const MIN_OPACITY = 0.75;
 const MAX_OPACITY = 1.0;
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
 
 let overlayWindow = null;
 let isClickThrough = false;
-let currentOpacity = 0.98;
+let currentOpacity = 1.0;
 
 const user32 = isWindows && ffi
   ? ffi.Library('user32', {
-      SetWindowDisplayAffinity: ['bool', ['pointer', 'uint32']]
-    })
+    SetWindowDisplayAffinity: ['bool', ['pointer', 'uint32']]
+  })
   : null;
 
 const kernel32 = isWindows && ffi
   ? ffi.Library('kernel32', {
-      GetLastError: ['uint32', []]
-    })
+    GetLastError: ['uint32', []]
+  })
   : null;
 
 function hwndBufferToPointer(nativeHandleBuffer) {
@@ -205,12 +205,16 @@ function registerShortcuts() {
 function configureCapturePermissions() {
   const electronSession = session.defaultSession;
 
+  // Grant all media permissions: microphone, audio-capture, display-capture
+  // This is required for webkitSpeechRecognition to access the mic
   electronSession.setPermissionCheckHandler((_webContents, permission) => {
-    return permission === 'media' || permission === 'display-capture';
+    const allowed = ['media', 'display-capture', 'audio-capture', 'microphone'];
+    return allowed.includes(permission);
   });
 
   electronSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    callback(permission === 'media' || permission === 'display-capture');
+    const allowed = ['media', 'display-capture', 'audio-capture', 'microphone'];
+    callback(allowed.includes(permission));
   });
 
   electronSession.setDisplayMediaRequestHandler(
@@ -234,7 +238,28 @@ function configureCapturePermissions() {
   );
 }
 
-function createOpenAiRequestBody(prompt, audioBase64, format) {
+function createTextRequestBody(systemPrompt, userText) {
+  return {
+    model: 'gpt-4o',
+    stream: true,
+    temperature: 0.3,
+    messages: [
+      {
+        role: 'system',
+        content:
+          systemPrompt && systemPrompt.trim()
+            ? systemPrompt.trim()
+            : 'You are a fast desktop assistant. Answer concisely and clearly.'
+      },
+      {
+        role: 'user',
+        content: userText
+      }
+    ]
+  };
+}
+
+function createAudioRequestBody(prompt, audioBase64, format) {
   return {
     model: 'gpt-audio',
     stream: true,
@@ -244,7 +269,7 @@ function createOpenAiRequestBody(prompt, audioBase64, format) {
       {
         role: 'system',
         content:
-          'You are a fast desktop assistant. First transcribe the audio faithfully. Then answer the user prompt clearly. Return plain text using exactly this format:\nTRANSCRIPT:\n<clean transcript>\n\nRESPONSE:\n<clean helpful answer>. Keep the response concise and easy to read.'
+          'You are a fast desktop assistant. First transcribe the audio faithfully. Then answer the user prompt clearly. Keep the response concise and easy to read.'
       },
       {
         role: 'user',
@@ -383,19 +408,27 @@ async function readNonStreamCompletion(response) {
 async function runOpenAiRequest(sender, payload) {
   const requestId = payload?.requestId || `req_${Date.now()}`;
   const apiKey = payload?.apiKey?.trim();
+  const transcribedText = payload?.transcribedText;
   const audioBase64 = payload?.audioBase64;
   const prompt = payload?.prompt || '';
   const format = payload?.format || 'wav';
 
   if (!apiKey) {
-    throw new Error('Enter your OpenAI API key before sending audio.');
+    throw new Error('Enter your OpenAI API key before sending.');
   }
 
-  if (!audioBase64) {
-    throw new Error('Record audio first, then click Send.');
+  // Determine if this is a text-based or audio-based request
+  const isTextRequest = format === 'text' && transcribedText;
+
+  if (!isTextRequest && !audioBase64) {
+    throw new Error('No content to send. Start listening first.');
   }
 
   sender.send('openai:started', { requestId });
+
+  const requestBody = isTextRequest
+    ? createTextRequestBody(prompt, transcribedText)
+    : createAudioRequestBody(prompt, audioBase64, format);
 
   const response = await fetch(OPENAI_API_URL, {
     method: 'POST',
@@ -403,7 +436,7 @@ async function runOpenAiRequest(sender, payload) {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`
     },
-    body: JSON.stringify(createOpenAiRequestBody(prompt, audioBase64, format))
+    body: JSON.stringify(requestBody)
   });
 
   if (!response.ok) {
@@ -431,6 +464,56 @@ function registerIpcHandlers() {
         message: error.message || 'Unknown OpenAI request error.'
       });
     });
+  });
+
+  // Whisper transcription for live audio chunks
+  ipcMain.handle('whisper:transcribe', async (_event, payload) => {
+    const apiKey = payload?.apiKey?.trim();
+    const audioBase64 = payload?.audioBase64;
+
+    if (!apiKey || !audioBase64) {
+      return { text: '', error: 'Missing API key or audio data.' };
+    }
+
+    try {
+      // Convert base64 to Buffer
+      const audioBuffer = Buffer.from(audioBase64, 'base64');
+
+      // Build multipart form data manually
+      const boundary = '----WhisperBoundary' + Date.now();
+      const modelPart = `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`;
+      const languagePart = `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen\r\n`;
+      const filePart = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="chunk.wav"\r\nContent-Type: audio/wav\r\n\r\n`;
+      const endPart = `\r\n--${boundary}--\r\n`;
+
+      const bodyParts = [
+        Buffer.from(modelPart, 'utf-8'),
+        Buffer.from(languagePart, 'utf-8'),
+        Buffer.from(filePart, 'utf-8'),
+        audioBuffer,
+        Buffer.from(endPart, 'utf-8')
+      ];
+      const body = Buffer.concat(bodyParts);
+
+      const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': `multipart/form-data; boundary=${boundary}`
+        },
+        body
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return { text: '', error: `Whisper failed (${response.status}): ${errorText}` };
+      }
+
+      const result = await response.json();
+      return { text: result.text || '' };
+    } catch (error) {
+      return { text: '', error: error.message || 'Whisper transcription error.' };
+    }
   });
 }
 
@@ -464,7 +547,12 @@ function createWindow() {
   overlayWindow.setMenuBarVisibility(false);
   overlayWindow.setOpacity(currentOpacity);
   enforceOverlayBehavior(overlayWindow);
-  overlayWindow.loadFile(path.join(__dirname, 'index.html'));
+
+  if (process.env.VITE_DEV_SERVER_URL) {
+    overlayWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+  } else {
+    overlayWindow.loadFile(path.join(__dirname, 'dist-vue', 'index.html'));
+  }
 
   overlayWindow.webContents.on('did-finish-load', () => {
     emitWindowState();
