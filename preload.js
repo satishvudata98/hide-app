@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('overlayApi', {
   quitApp: () => ipcRenderer.invoke('app:quit'),
   runOpenAiRequest: (payload) => ipcRenderer.send('openai:run', payload),
   transcribeAudio: (payload) => ipcRenderer.invoke('whisper:transcribe', payload),
+  captureScreen: () => ipcRenderer.invoke('app:capture-screen'),
+  resizeHeight: (height) => ipcRenderer.send('app:resize-height', height),
   onWindowState: (callback) => subscribe('app:window-state', callback),
   onSystemError: (callback) => subscribe('app:system-error', callback),
   onOpenAiStarted: (callback) => subscribe('openai:started', callback),

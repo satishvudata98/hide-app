@@ -15,6 +15,6 @@ import WorkspaceScreen from './components/WorkspaceScreen.vue'
   display: flex;
   flex-direction: column;
   background: transparent;
-  padding: 8px;
+  padding: 0;
 }
 </style>

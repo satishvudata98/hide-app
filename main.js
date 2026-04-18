@@ -7,6 +7,7 @@ const {
   desktopCapturer,
   globalShortcut,
   ipcMain,
+  screen,
   session
 } = require('electron');
 
@@ -259,6 +260,40 @@ function createTextRequestBody(systemPrompt, userText) {
   };
 }
 
+function createVisionRequestBody(systemPrompt, userText, imageBase64) {
+  return {
+    model: 'gpt-4o',
+    stream: true,
+    temperature: 0.3,
+    max_tokens: 1024,
+    messages: [
+      {
+        role: 'system',
+        content:
+          systemPrompt && systemPrompt.trim()
+            ? systemPrompt.trim()
+            : 'You are a fast desktop assistant. Analyze the screenshot and answer concisely. Use bullet points for structured answers.'
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: userText || 'Analyze this screenshot and describe what you see. If there is a question visible, answer it.'
+          },
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:image/png;base64,${imageBase64}`,
+              detail: 'high'
+            }
+          }
+        ]
+      }
+    ]
+  };
+}
+
 function createAudioRequestBody(prompt, audioBase64, format) {
   return {
     model: 'gpt-audio',
@@ -410,6 +445,7 @@ async function runOpenAiRequest(sender, payload) {
   const apiKey = payload?.apiKey?.trim();
   const transcribedText = payload?.transcribedText;
   const audioBase64 = payload?.audioBase64;
+  const imageBase64 = payload?.imageBase64;
   const prompt = payload?.prompt || '';
   const format = payload?.format || 'wav';
 
@@ -417,18 +453,24 @@ async function runOpenAiRequest(sender, payload) {
     throw new Error('Enter your OpenAI API key before sending.');
   }
 
-  // Determine if this is a text-based or audio-based request
+  // Determine request type: vision, text, or audio
+  const isVisionRequest = !!imageBase64;
   const isTextRequest = format === 'text' && transcribedText;
 
-  if (!isTextRequest && !audioBase64) {
+  if (!isVisionRequest && !isTextRequest && !audioBase64) {
     throw new Error('No content to send. Start listening first.');
   }
 
   sender.send('openai:started', { requestId });
 
-  const requestBody = isTextRequest
-    ? createTextRequestBody(prompt, transcribedText)
-    : createAudioRequestBody(prompt, audioBase64, format);
+  let requestBody;
+  if (isVisionRequest) {
+    requestBody = createVisionRequestBody(prompt, transcribedText || '', imageBase64);
+  } else if (isTextRequest) {
+    requestBody = createTextRequestBody(prompt, transcribedText);
+  } else {
+    requestBody = createAudioRequestBody(prompt, audioBase64, format);
+  }
 
   const response = await fetch(OPENAI_API_URL, {
     method: 'POST',
@@ -464,6 +506,36 @@ function registerIpcHandlers() {
         message: error.message || 'Unknown OpenAI request error.'
       });
     });
+  });
+
+  // Screen capture for "analyze screen" feature
+  ipcMain.handle('app:capture-screen', async () => {
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 1920, height: 1080 }
+      });
+
+      if (!sources || sources.length === 0) {
+        return { error: 'No screen sources found.' };
+      }
+
+      const primarySource = sources[0];
+      const thumbnail = primarySource.thumbnail;
+      const pngBuffer = thumbnail.toPNG();
+      const base64 = pngBuffer.toString('base64');
+
+      return { imageBase64: base64 };
+    } catch (error) {
+      return { error: error.message || 'Screen capture failed.' };
+    }
+  });
+
+  // Resize the overlay window height dynamically
+  ipcMain.on('app:resize-height', (_event, height) => {
+    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+    const bounds = overlayWindow.getBounds();
+    overlayWindow.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: Math.max(80, Math.round(height)) });
   });
 
   // Whisper transcription for live audio chunks
@@ -518,13 +590,21 @@ function registerIpcHandlers() {
 }
 
 function createWindow() {
+  // Position window top-center of primary display
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const workArea = primaryDisplay.workAreaSize;
+  const winWidth = 580;
+  const winHeight = 110; // compact initial height, will auto-resize
+  const xPos = Math.round((workArea.width - winWidth) / 2);
+  const yPos = 12; // small gap from top edge
+
   overlayWindow = new BrowserWindow({
-    width: 700,
-    height: 600,
-    minWidth: 700,
-    minHeight: 600,
-    x: 48,
-    y: 48,
+    width: winWidth,
+    height: winHeight,
+    minWidth: winWidth,
+    minHeight: 80,
+    x: xPos,
+    y: yPos,
     show: false,
     frame: false,
     transparent: true,

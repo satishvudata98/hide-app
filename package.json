@@ -2,7 +2,7 @@
   "name": "windows-capture-excluded-overlay",
   "version": "1.0.0",
   "description": "Minimal Electron overlay for Windows that stays visible locally while requesting capture exclusion via SetWindowDisplayAffinity.",
-  "productName": "InvisibleOverlay",
+  "productName": "Screnshield",
   "main": "main.js",
   "scripts": {
     "dev": "vite",
@@ -35,7 +35,7 @@
   },
   "build": {
     "appId": "com.vsatish.invisibleoverlay",
-    "productName": "InvisibleOverlay",
+    "productName": "Screnshield",
     "asar": true,
     "npmRebuild": false,
     "files": [

@@ -1,23 +1,29 @@
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 
 // ── Config ──
 const API_KEY = import.meta.env.VITE_OPENAI_API_KEY || ''
-const SYSTEM_PROMPT = 'You are a fast desktop assistant. Answer concisely and clearly based on the user question or transcript provided. Keep responses structured and easy to read.'
+const SYSTEM_PROMPT = 'You are a fast desktop assistant and you have 5 years of  experiennce in software engineering. Answer concisely and clearly. Use bullet points for structured answers. Keep it tight.'
 
-// ── State ──
-const isRecording = ref(false)
-const isSending = ref(false)
-const recordingTime = ref(0)
-const responseText = ref('')
+// ── State machine: idle → recording → answering ──
+const appState = ref('idle') // 'idle' | 'recording' | 'answering'
+const transcriptText = ref('')
+const answerText = ref('')
+const detectedQuestion = ref('')
+const answerElapsed = ref(0)
+const showAnswer = ref(false)
 const statusMsg = ref('')
-const audioReady = ref(false)
 
 let requestId = null
-let captureState = null
-let timerId = null
-let audioBase64 = ''
-let wavBytes = 0
+let recognition = null
+let recognitionRestarting = false
+let answerTimer = null
+let answerStartTime = 0
+let resizeObserver = null
+
+// ── Computed ──
+const isRecording = computed(() => appState.value === 'recording')
+const isAnswering = computed(() => appState.value === 'answering')
 
 // ── Audio Helpers ──
 function mixToMono(inputBuffer) {
@@ -89,133 +95,133 @@ function arrayBufferToBase64(buffer) {
   })
 }
 
-function stopTracks(cap) {
-  if (!cap) return
-  for (const s of [cap.systemStream, cap.micStream]) {
-    if (s) s.getTracks().forEach(t => t.stop())
-  }
-  if (cap.processor) cap.processor.disconnect()
-  if (cap.silenceNode) cap.silenceNode.disconnect()
-  for (const n of cap.nodes || []) { n.source.disconnect(); n.gain.disconnect() }
-}
+let micStream = null
+let audioContext = null
+let processor = null
+let silenceGain = null
+let audioChunks = []
+let chunkTimer = null
+let isProcessingChunk = false
 
-// ── Start Recording ──
 async function startRecording() {
-  if (isRecording.value || isSending.value) return
+  if (appState.value !== 'idle') return
+  if (!API_KEY) {
+    statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
+    return
+  }
 
-  responseText.value = ''
+  transcriptText.value = ''
+  answerText.value = ''
+  detectedQuestion.value = ''
+  showAnswer.value = false
   statusMsg.value = ''
-  audioBase64 = ''
-  wavBytes = 0
-  audioReady.value = false
-
-  let systemStream = null
-  let micStream = null
+  audioChunks = []
 
   try {
-    systemStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: false
     })
 
-    const ctx = new AudioContext()
-    const proc = ctx.createScriptProcessor(4096, 2, 1)
+    audioContext = new AudioContext()
+    processor = audioContext.createScriptProcessor(4096, 1, 1)
 
     // Silent output to keep processor alive
-    const silenceGain = ctx.createGain()
+    silenceGain = audioContext.createGain()
     silenceGain.gain.value = 0
-    proc.connect(silenceGain)
-    silenceGain.connect(ctx.destination)
+    processor.connect(silenceGain)
+    silenceGain.connect(audioContext.destination)
 
-    const nodes = []
-    const chunks = []
+    const source = audioContext.createMediaStreamSource(micStream)
+    source.connect(processor)
 
-    const connectStream = (stream) => {
-      if (!stream || !stream.getAudioTracks().length) return false
-      const source = ctx.createMediaStreamSource(stream)
-      const gain = ctx.createGain()
-      gain.gain.value = 1
-      source.connect(gain)
-      gain.connect(proc)
-      nodes.push({ source, gain })
-      return true
+    processor.onaudioprocess = (e) => {
+      if (appState.value === 'recording') {
+        audioChunks.push(mixToMono(e.inputBuffer))
+      }
     }
 
-    const hasSys = connectStream(systemStream)
-    const hasMic = connectStream(micStream)
+    appState.value = 'recording'
 
-    proc.onaudioprocess = (e) => {
-      if (!isRecording.value) return
-      chunks.push(mixToMono(e.inputBuffer))
-    }
+    // Send chunks to Whisper API every 3.5 seconds
+    chunkTimer = setInterval(async () => {
+      if (audioChunks.length === 0 || isProcessingChunk) return
+      isProcessingChunk = true
 
-    captureState = { audioContext: ctx, processor: proc, silenceNode: silenceGain, chunks, nodes, systemStream, micStream, startedAt: performance.now() }
-    isRecording.value = true
-    recordingTime.value = 0
+      const chunksToSend = audioChunks
+      audioChunks = [] // clear for next batch
 
-    timerId = setInterval(() => {
-      recordingTime.value = ((performance.now() - captureState.startedAt) / 1000)
-    }, 200)
+      const merged = mergeChunks(chunksToSend)
+      const downsampled = downsample(merged, audioContext.sampleRate, 16000)
+      const wavBuffer = encodeWav(downsampled, 16000)
+      const base64 = await arrayBufferToBase64(wavBuffer)
 
-    if (hasSys) {
-      statusMsg.value = 'Recording system audio + mic...'
-    } else {
-      statusMsg.value = 'Recording mic only. System audio not detected.'
-    }
-  } catch (error) {
-    stopTracks({ systemStream, micStream })
-    statusMsg.value = `Capture failed: ${error.message}`
-    isRecording.value = false
+      if (window.overlayApi) {
+        const res = await window.overlayApi.transcribeAudio({ apiKey: API_KEY, audioBase64: base64 })
+        if (res && res.text) {
+          transcriptText.value += (transcriptText.value ? ' ' : '') + res.text.trim()
+        } else if (res && res.error) {
+          console.warn('Whisper error:', res.error)
+        }
+      }
+      isProcessingChunk = false
+    }, 3500)
+
+  } catch (err) {
+    statusMsg.value = 'Mic access failed: ' + err.message
+    stopRecording()
   }
 }
 
-// ── Stop & Send ──
-async function stopAndSend() {
-  if (!isRecording.value || !captureState) return
-
-  const cap = captureState
-  isRecording.value = false
-  clearInterval(timerId)
-  timerId = null
-
-  const duration = (performance.now() - cap.startedAt) / 1000
-  recordingTime.value = duration
-
-  stopTracks(cap)
-  try { await cap.audioContext.close() } catch (_) {}
-
-  const merged = mergeChunks(cap.chunks)
-  if (!merged.length) {
-    captureState = null
-    statusMsg.value = 'No audio captured. Try again.'
-    return
+function stopRecording() {
+  if (chunkTimer) {
+    clearInterval(chunkTimer)
+    chunkTimer = null
   }
-
-  const downsampled = downsample(merged, cap.audioContext.sampleRate, 16000)
-  const wavBuffer = encodeWav(downsampled, 16000)
-  audioBase64 = await arrayBufferToBase64(wavBuffer)
-  wavBytes = wavBuffer.byteLength
-  captureState = null
-
-  // Immediately send
-  sendToOpenAi()
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop())
+    micStream = null
+  }
+  if (processor) {
+    processor.disconnect()
+    processor = null
+  }
+  if (silenceGain) {
+    silenceGain.disconnect()
+    silenceGain = null
+  }
+  if (audioContext) {
+    audioContext.close().catch(() => {})
+    audioContext = null
+  }
+  if (appState.value === 'recording') {
+    appState.value = 'idle'
+  }
 }
 
-function sendToOpenAi() {
-  if (!audioBase64) {
-    statusMsg.value = 'No audio to send.'
+// ── Answer Question ──
+function answerQuestion() {
+  const text = transcriptText.value.trim()
+  if (!text) {
+    statusMsg.value = 'No transcript to analyze.'
     return
   }
-
   if (!API_KEY) {
-    statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env and rebuild.'
+    statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
     return
   }
 
-  isSending.value = true
-  responseText.value = ''
-  statusMsg.value = 'Sending audio to OpenAI...'
+  detectedQuestion.value = text
+  answerText.value = ''
+  showAnswer.value = true
+  appState.value = 'answering'
+  answerStartTime = Date.now()
+  answerElapsed.value = 0
+
+  answerTimer = setInterval(() => {
+    answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
+  }, 500)
+
   requestId = `req_${Date.now()}`
 
   if (window.overlayApi) {
@@ -223,38 +229,98 @@ function sendToOpenAi() {
       requestId,
       apiKey: API_KEY,
       prompt: SYSTEM_PROMPT,
-      audioBase64,
-      format: 'wav'
+      transcribedText: text,
+      format: 'text'
     })
   }
 }
 
-function clearAll() {
-  if (timerId) { clearInterval(timerId); timerId = null }
-  if (captureState) {
-    captureState.audioContext.close().catch(() => {})
-    stopTracks(captureState)
+// ── Analyze Screen ──
+async function analyzeScreen() {
+  if (!API_KEY) {
+    statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
+    return
   }
-  captureState = null
-  isRecording.value = false
-  isSending.value = false
-  audioBase64 = ''
-  wavBytes = 0
-  audioReady.value = false
-  recordingTime.value = 0
-  responseText.value = ''
+
+  statusMsg.value = 'Capturing screen...'
+
+  if (!window.overlayApi?.captureScreen) {
+    statusMsg.value = 'Screen capture not available.'
+    return
+  }
+
+  const result = await window.overlayApi.captureScreen()
+  if (result.error) {
+    statusMsg.value = 'Capture failed: ' + result.error
+    return
+  }
+
+  detectedQuestion.value = 'Screen analysis requested'
+  answerText.value = ''
+  showAnswer.value = true
+  appState.value = 'answering'
+  answerStartTime = Date.now()
+  answerElapsed.value = 0
   statusMsg.value = ''
+
+  answerTimer = setInterval(() => {
+    answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
+  }, 500)
+
+  requestId = `req_${Date.now()}`
+
+  if (window.overlayApi) {
+    window.overlayApi.runOpenAiRequest({
+      requestId,
+      apiKey: API_KEY,
+      prompt: SYSTEM_PROMPT,
+      transcribedText: transcriptText.value.trim() || '',
+      imageBase64: result.imageBase64,
+      format: 'text'
+    })
+  }
 }
 
+// ── Close answer ──
+function closeAnswer() {
+  showAnswer.value = false
+  answerText.value = ''
+  detectedQuestion.value = ''
+  if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+  answerElapsed.value = 0
+
+  // Do not resume recording automatically unless they click the record pill
+  appState.value = 'idle'
+}
+
+// ── Clear transcript ──
+function clearTranscript() {
+  transcriptText.value = ''
+}
+
+// ── Exit ──
 function quitApp() {
   if (window.overlayApi) window.overlayApi.quitApp()
 }
 
-// ── Format time ──
-function fmtTime(sec) {
-  const m = Math.floor(sec / 60)
-  const s = Math.floor(sec % 60)
-  return `${m}:${s.toString().padStart(2, '0')}`
+// ── Format answer text to bullet points ──
+const formattedAnswer = computed(() => {
+  if (!answerText.value) return []
+  const lines = answerText.value.split('\n').filter(l => l.trim())
+  return lines.map(line => {
+    // Strip leading bullet markers for uniform rendering
+    return line.replace(/^[\s]*[-•*]\s*/, '').trim()
+  }).filter(l => l)
+})
+
+// ── Dynamic window height ──
+const rootEl = ref(null)
+
+function syncWindowHeight() {
+  if (!rootEl.value || !window.overlayApi?.resizeHeight) return
+  // Measure the actual rendered content + some padding
+  const height = rootEl.value.scrollHeight + 24 // 24 for body padding
+  window.overlayApi.resizeHeight(height)
 }
 
 // ── OpenAI response handlers ──
@@ -263,243 +329,484 @@ onMounted(() => {
 
   window.overlayApi.onOpenAiStarted((p) => {
     if (p.requestId !== requestId) return
-    statusMsg.value = 'Processing...'
+    statusMsg.value = ''
   })
 
   window.overlayApi.onOpenAiDelta((p) => {
     if (p.requestId !== requestId) return
-    responseText.value = p.text || ''
+    answerText.value = p.text || ''
   })
 
   window.overlayApi.onOpenAiDone((p) => {
     if (p.requestId !== requestId) return
-    isSending.value = false
-    responseText.value = p.text || responseText.value
-    statusMsg.value = ''
+    answerText.value = p.text || answerText.value
+    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+    // Stay in answering state until user closes
   })
 
   window.overlayApi.onOpenAiError((p) => {
     if (p.requestId && p.requestId !== requestId) return
-    isSending.value = false
     statusMsg.value = p.message || 'Request failed.'
+    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+    appState.value = 'idle'
+  })
+
+  // Observe root element to auto-resize window
+  nextTick(() => {
+    if (rootEl.value) {
+      resizeObserver = new ResizeObserver(() => syncWindowHeight())
+      resizeObserver.observe(rootEl.value)
+      syncWindowHeight()
+    }
   })
 })
 
-onUnmounted(() => { clearAll() })
+onUnmounted(() => {
+  stopRecording()
+  if (answerTimer) clearInterval(answerTimer)
+  if (resizeObserver) resizeObserver.disconnect()
+})
 
-const responseEl = ref(null)
-watch(responseText, async () => {
+// Auto-resize whenever answer or transcript changes
+watch([answerText, showAnswer, transcriptText, appState, statusMsg], () => {
+  nextTick(() => syncWindowHeight())
+})
+
+const answerBodyEl = ref(null)
+watch(answerText, async () => {
   await nextTick()
-  if (responseEl.value) responseEl.value.scrollTop = responseEl.value.scrollHeight
+  if (answerBodyEl.value) answerBodyEl.value.scrollTop = answerBodyEl.value.scrollHeight
 })
 </script>
 
 <template>
-  <div class="hud">
-    <!-- ─── Recording indicator ─── -->
-    <div class="rec-bar glass" v-if="isRecording">
-      <span class="rec-dot"></span>
-      <span class="rec-time">{{ fmtTime(recordingTime) }}</span>
-      <span class="rec-label">Recording</span>
-    </div>
+  <div class="overlay-root" ref="rootEl">
 
-    <!-- ─── Response Panel ─── -->
-    <div class="panel response-panel glass" v-if="responseText || isSending">
-      <div class="panel-label">
-        <span class="indicator accent" :class="{ active: isSending }"></span>
-        <span>{{ isSending ? 'Generating...' : 'Response' }}</span>
+    <!-- ═══ MAIN OVERLAY BLOCK ═══ -->
+    <div class="main-bar">
+
+      <!-- Row 1: Top bar — drag handle + rec pill + exit -->
+      <div class="top-row">
+        <div class="drag-handle" title="Drag to move">· · ·</div>
+        <div class="top-right">
+          <div class="rec-pill" :class="{ active: isRecording }" @click="isRecording ? stopRecording() : startRecording()">
+            <span class="rec-dot" :class="{ pulsing: isRecording }"></span>
+            <span class="rec-label">rec</span>
+          </div>
+          <button class="icon-btn exit-btn" @click="quitApp" title="Exit">✕</button>
+        </div>
       </div>
-      <div class="response-text" ref="responseEl">
-        {{ responseText }}<span v-if="isSending && !responseText" class="cursor accent">|</span>
+
+      <!-- Row 2: Action buttons -->
+      <div class="action-row">
+        <button class="action-btn indigo" @click="answerQuestion" :disabled="isAnswering || !transcriptText.trim()">
+          <span class="action-icon">☰</span>
+          <span>answer question</span>
+        </button>
+        <button class="action-btn green" @click="analyzeScreen" :disabled="isAnswering">
+          <span class="action-icon">◻</span>
+          <span>analyze screen</span>
+        </button>
+      </div>
+
+      <!-- Row 3: Transcript row -->
+      <div class="transcript-row">
+        <div class="transcript-text">
+          <span v-if="transcriptText">{{ transcriptText }}</span>
+          <span v-else class="transcript-placeholder">{{ isRecording ? 'listening...' : 'start recording to see transcript' }}</span>
+          <span v-if="isRecording" class="blink-cursor">|</span>
+        </div>
+        <button class="clear-btn" @click="clearTranscript" v-if="transcriptText" title="Clear transcript">clear</button>
+      </div>
+
+      <!-- Status message -->
+      <div class="status-msg" v-if="statusMsg">{{ statusMsg }}</div>
+    </div>
+
+    <!-- ═══ CONNECTOR LINE ═══ -->
+    <div class="connector-line" v-if="showAnswer"></div>
+
+    <!-- ═══ ANSWER BLOCK ═══ -->
+    <div class="answer-block" v-if="showAnswer">
+      <div class="answer-header">
+        <div class="answer-label">
+          <span class="answer-dot"></span>
+          <span>ai answer</span>
+        </div>
+        <span class="answer-elapsed" v-if="answerElapsed > 0">{{ answerElapsed }}s</span>
+        <button class="icon-btn close-btn" @click="closeAnswer" title="Close">✕</button>
+      </div>
+
+      <div class="answer-body" ref="answerBodyEl">
+        <!-- Detected question -->
+        <div class="detected-question" v-if="detectedQuestion">
+          "{{ detectedQuestion }}"
+        </div>
+
+        <!-- Streaming answer -->
+        <div class="answer-content" v-if="answerText">
+          <div v-for="(line, i) in formattedAnswer" :key="i" class="answer-bullet">
+            <span class="bullet-dot">·</span>
+            <span>{{ line }}</span>
+          </div>
+        </div>
+
+        <!-- Loading state -->
+        <div class="answer-loading" v-if="!answerText && appState === 'answering'">
+          <span class="blink-cursor accent">|</span>
+        </div>
       </div>
     </div>
 
-    <!-- ─── Status ─── -->
-    <div class="status-bar glass" v-if="statusMsg && !isRecording">
-      {{ statusMsg }}
-    </div>
-
-    <!-- Spacer to push controls to bottom -->
-    <div class="spacer"></div>
-
-    <!-- ─── Controls ─── -->
-    <div class="controls glass">
-      <button
-        class="ctrl-btn start"
-        :class="{ recording: isRecording }"
-        @click="isRecording ? stopAndSend() : startRecording()"
-        :disabled="isSending"
-      >
-        {{ isRecording ? '⬆ Send' : '▶ Start' }}
-      </button>
-      <button class="ctrl-btn" @click="clearAll" :disabled="isRecording">
-        Clear
-      </button>
-      <button class="ctrl-btn exit" @click="quitApp">
-        ✕
-      </button>
-    </div>
   </div>
 </template>
 
 <style scoped>
-.hud {
-  flex: 1;
+/* ═══════════════════════════════════════════
+   OVERLAY ROOT
+   ═══════════════════════════════════════════ */
+.overlay-root {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  align-items: stretch;
+  padding: 8px;
+  gap: 0;
+}
+
+/* ═══════════════════════════════════════════
+   MAIN BAR
+   ═══════════════════════════════════════════ */
+.main-bar {
+  background: var(--overlay-bg);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--overlay-border);
+  border-radius: 12px;
   overflow: hidden;
 }
 
-/* ── Recording bar ── */
-.rec-bar {
+/* ── Row 1: Top bar ── */
+.top-row {
+  height: 34px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  font-size: 13px;
+  justify-content: space-between;
+  padding: 0 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.drag-handle {
+  -webkit-app-region: drag;
+  flex: 1;
+  color: var(--text-hint);
+  font-size: 14px;
+  letter-spacing: 3px;
+  cursor: grab;
+  padding: 4px 0;
+}
+
+.top-right {
+  -webkit-app-region: no-drag;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rec-pill {
+  -webkit-app-region: no-drag;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 8px;
+  border-radius: 20px;
+  background: rgba(239, 68, 68, 0.10);
+  border: 1px solid rgba(239, 68, 68, 0.20);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.rec-pill:hover {
+  background: rgba(239, 68, 68, 0.18);
+}
+
+.rec-pill.active {
+  background: rgba(239, 68, 68, 0.16);
+  border-color: rgba(239, 68, 68, 0.35);
 }
 
 .rec-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  background: var(--danger);
-  animation: pulse-glow 1.5s infinite;
+  background: var(--red);
+  opacity: 0.4;
+  flex-shrink: 0;
 }
 
-.rec-time {
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  color: var(--text);
+.rec-dot.pulsing {
+  opacity: 1;
+  animation: pulse-red 1.2s ease-in-out infinite;
 }
 
 .rec-label {
-  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--red);
+  text-transform: lowercase;
 }
 
-/* ── Panels ── */
-.panel {
-  padding: 12px 14px;
+.icon-btn {
+  -webkit-app-region: no-drag;
+  width: 24px;
+  height: 24px;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-hint);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s ease;
 }
 
-.panel-label {
+.icon-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.exit-btn:hover {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+/* ── Row 2: Action buttons ── */
+.action-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 11px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--muted);
+  padding: 7px 10px;
 }
 
-.indicator {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.15);
-  flex-shrink: 0;
-}
-
-.indicator.accent.active {
-  background: var(--accent);
-  animation: pulse-glow 1.5s infinite;
-}
-
-.response-panel {
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.response-text {
-  font-size: 14px;
-  line-height: 1.65;
-  color: rgba(255, 255, 255, 0.9);
-  white-space: pre-wrap;
-  word-break: break-word;
-  overflow-y: auto;
-  flex: 1;
-  min-height: 0;
-}
-
-.cursor {
-  animation: blink-cursor 0.8s infinite;
-  font-weight: 300;
-}
-.cursor.accent { color: var(--accent); }
-
-/* ── Status ── */
-.status-bar {
-  padding: 8px 14px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.spacer {
-  flex: 1;
-}
-
-/* ── Controls ── */
-.controls {
+.action-btn {
+  -webkit-app-region: no-drag;
   display: flex;
+  align-items: center;
   gap: 6px;
-  padding: 8px;
-  flex-shrink: 0;
-}
-
-.ctrl-btn {
-  height: 36px;
+  height: 32px;
+  padding: 0 16px;
   border: none;
   border-radius: 8px;
-  padding: 0 14px;
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.15s ease;
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--text);
-  flex: 1;
+  justify-content: center;
+  flex-shrink: 0;
 }
 
-.ctrl-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.1);
-}
-
-.ctrl-btn:disabled {
-  opacity: 0.3;
+.action-btn:disabled {
+  opacity: 0.35;
   cursor: not-allowed;
 }
 
-.ctrl-btn.start {
-  background: linear-gradient(180deg, var(--accent), #7ad14d);
-  color: #0a0e08;
-  font-weight: 600;
-  flex: 2;
+.action-btn.indigo {
+  background: var(--indigo-dim);
+  color: var(--indigo);
+  border: 1px solid rgba(99, 102, 241, 0.18);
 }
 
-.ctrl-btn.start:hover:not(:disabled) {
-  filter: brightness(1.1);
+.action-btn.indigo:hover:not(:disabled) {
+  background: rgba(99, 102, 241, 0.22);
 }
 
-.ctrl-btn.start.recording {
-  background: linear-gradient(180deg, #ff8d7d, var(--danger));
-  color: #fff;
+.action-btn.green {
+  background: var(--green-dim);
+  color: var(--green);
+  border: 1px solid rgba(16, 185, 129, 0.18);
 }
 
-.ctrl-btn.exit {
-  flex: 0 0 36px;
-  padding: 0;
-  color: var(--muted);
+.action-btn.green:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.22);
+}
+
+.action-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+/* ── Row 3: Transcript row ── */
+.transcript-row {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 10px;
+  gap: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.transcript-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 32px;
+}
+
+.transcript-placeholder {
+  color: var(--text-hint);
+  font-style: italic;
+}
+
+.blink-cursor {
+  color: var(--text-secondary);
+  animation: blink-cursor 0.8s step-end infinite;
+  margin-left: 1px;
+}
+
+.blink-cursor.accent {
+  color: var(--indigo);
+}
+
+.clear-btn {
+  -webkit-app-region: no-drag;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  color: var(--text-hint);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-transform: lowercase;
+  flex-shrink: 0;
+}
+
+.clear-btn:hover {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* ── Status ── */
+.status-msg {
+  padding: 4px 10px 6px;
+  font-size: 10px;
+  color: var(--text-hint);
+  border-top: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+/* ═══════════════════════════════════════════
+   CONNECTOR LINE
+   ═══════════════════════════════════════════ */
+.connector-line {
+  width: 1px;
+  height: 10px;
+  background: var(--answer-border);
+  margin: 0 auto;
+  flex-shrink: 0;
+}
+
+/* ═══════════════════════════════════════════
+   ANSWER BLOCK
+   ═══════════════════════════════════════════ */
+.answer-block {
+  -webkit-app-region: no-drag;
+  background: var(--answer-bg);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--answer-border);
+  border-radius: 12px;
+  overflow: hidden;
+  animation: slide-down 0.25s ease-out;
+}
+
+.answer-header {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 10px;
+  border-bottom: 1px solid rgba(99, 102, 241, 0.10);
+  gap: 8px;
+}
+
+.answer-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--indigo);
+  text-transform: lowercase;
+}
+
+.answer-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--indigo);
+  flex-shrink: 0;
+}
+
+.answer-elapsed {
+  font-size: 10px;
+  color: var(--text-hint);
+  font-variant-numeric: tabular-nums;
+}
+
+.close-btn:hover {
+  color: var(--text-primary);
+}
+
+.answer-body {
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow-y: auto;
+  user-select: text;
+}
+
+.detected-question {
+  font-style: italic;
+  font-size: 11px;
+  color: var(--text-hint);
+  margin-bottom: 8px;
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.answer-content {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.answer-bullet {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  align-items: baseline;
+}
+
+.bullet-dot {
+  color: var(--indigo);
+  font-weight: 700;
+  font-size: 16px;
+  line-height: 1;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.answer-loading {
+  padding: 4px 0;
   font-size: 14px;
-}
-
-.ctrl-btn.exit:hover {
-  color: var(--danger);
-  background: rgba(255, 111, 111, 0.1);
 }
 </style>
