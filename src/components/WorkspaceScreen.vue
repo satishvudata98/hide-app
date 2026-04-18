@@ -135,6 +135,7 @@ async function startRecording() {
     const source = audioContext.createMediaStreamSource(micStream)
     source.connect(processor)
 
+    // Just accumulate audio, don't send chunks
     processor.onaudioprocess = (e) => {
       if (appState.value === 'recording') {
         audioChunks.push(mixToMono(e.inputBuffer))
@@ -142,31 +143,6 @@ async function startRecording() {
     }
 
     appState.value = 'recording'
-
-    // Send chunks to Whisper API every 3.5 seconds
-    chunkTimer = setInterval(async () => {
-      if (audioChunks.length === 0 || isProcessingChunk) return
-      isProcessingChunk = true
-
-      const chunksToSend = audioChunks
-      audioChunks = [] // clear for next batch
-
-      const merged = mergeChunks(chunksToSend)
-      const downsampled = downsample(merged, audioContext.sampleRate, 16000)
-      const wavBuffer = encodeWav(downsampled, 16000)
-      const base64 = await arrayBufferToBase64(wavBuffer)
-
-      if (window.overlayApi) {
-        const res = await window.overlayApi.transcribeAudio({ apiKey: API_KEY, audioBase64: base64 })
-        if (res && res.text) {
-          transcriptText.value += (transcriptText.value ? ' ' : '') + res.text.trim()
-        } else if (res && res.error) {
-          console.warn('Whisper error:', res.error)
-        }
-      }
-      isProcessingChunk = false
-    }, 3500)
-
   } catch (err) {
     statusMsg.value = 'Mic access failed: ' + err.message
     stopRecording()
@@ -174,10 +150,6 @@ async function startRecording() {
 }
 
 function stopRecording() {
-  if (chunkTimer) {
-    clearInterval(chunkTimer)
-    chunkTimer = null
-  }
   if (micStream) {
     micStream.getTracks().forEach(t => t.stop())
     micStream = null
@@ -200,23 +172,41 @@ function stopRecording() {
 }
 
 // ── Answer Question ──
-function answerQuestion() {
-  const text = transcriptText.value.trim()
-  if (!text) {
-    statusMsg.value = 'No transcript to analyze.'
-    return
-  }
+async function answerQuestion() {
   if (!API_KEY) {
     statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
     return
   }
+  
+  let audioBase64 = null
+  
+  if (appState.value === 'recording') {
+    // If we are currently recording, stop and process the full audio
+    statusMsg.value = 'Processing audio...'
+    stopRecording()
+    
+    if (audioChunks.length > 0) {
+      const merged = mergeChunks(audioChunks)
+      const downsampled = downsample(merged, audioContext ? audioContext.sampleRate : 48000, 16000)
+      const wavBuffer = encodeWav(downsampled, 16000)
+      audioBase64 = await arrayBufferToBase64(wavBuffer)
+    }
+  }
 
-  detectedQuestion.value = text
+  const text = transcriptText.value.trim()
+  
+  if (!text && !audioBase64) {
+    statusMsg.value = 'No transcript or audio to analyze.'
+    return
+  }
+
+  detectedQuestion.value = audioBase64 ? 'Audio query submitted' : text
   answerText.value = ''
   showAnswer.value = true
   appState.value = 'answering'
   answerStartTime = Date.now()
   answerElapsed.value = 0
+  statusMsg.value = 'Sending to AI...'
 
   answerTimer = setInterval(() => {
     answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
@@ -225,13 +215,21 @@ function answerQuestion() {
   requestId = `req_${Date.now()}`
 
   if (window.overlayApi) {
-    window.overlayApi.runOpenAiRequest({
+    const payload = {
       requestId,
       apiKey: API_KEY,
       prompt: SYSTEM_PROMPT,
-      transcribedText: text,
-      format: 'text'
-    })
+    }
+    
+    if (audioBase64) {
+      payload.audioBase64 = audioBase64
+      payload.format = 'wav'
+    } else {
+      payload.transcribedText = text
+      payload.format = 'text'
+    }
+    
+    window.overlayApi.runOpenAiRequest(payload)
   }
 }
 
@@ -399,7 +397,7 @@ watch(answerText, async () => {
 
       <!-- Row 2: Action buttons -->
       <div class="action-row">
-        <button class="action-btn indigo" @click="answerQuestion" :disabled="isAnswering || !transcriptText.trim()">
+        <button class="action-btn indigo" @click="answerQuestion" :disabled="isAnswering || (!transcriptText.trim() && !isRecording)">
           <span class="action-icon">☰</span>
           <span>answer question</span>
         </button>

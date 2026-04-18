@@ -296,7 +296,7 @@ function createVisionRequestBody(systemPrompt, userText, imageBase64) {
 
 function createAudioRequestBody(prompt, audioBase64, format) {
   return {
-    model: 'gpt-audio',
+    model: 'gpt-4o-audio-preview',
     stream: true,
     modalities: ['text'],
     temperature: 0.2,
