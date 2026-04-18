@@ -401,11 +401,24 @@ watch(answerText, async () => {
     <!-- ═══ MAIN OVERLAY BLOCK ═══ -->
     <div class="main-bar">
 
-      <!-- Row 1: Top bar — drag handle + rec pill + exit -->
-      <div class="top-row">
-        <div class="drag-handle" title="Drag to move">· · ·</div>
-        <div class="top-right">
-          <div class="rec-pill" :class="{ active: isRecording }" @click="isRecording ? stopRecording() : startRecording()">
+      <!-- Single Action Row -->
+      <div class="single-row">
+        <div class="left-actions">
+          <button class="action-btn indigo" @click="answerQuestion" :disabled="isAnswering || (!transcriptText.trim() && !isRecording)">
+            <span class="action-icon">☰</span>
+            <span>answer question</span>
+          </button>
+          <button class="action-btn green" @click="analyzeScreen" :disabled="isAnswering">
+            <span class="action-icon">◻</span>
+            <span>analyze screen</span>
+          </button>
+        </div>
+
+        <!-- Drag area in the middle -->
+        <div class="drag-space" title="Drag to move"></div>
+
+        <div class="right-actions">
+          <div class="rec-pill" :class="isRecording ? 'active' : 'inactive'" @click="isRecording ? stopRecording() : startRecording()">
             <span class="rec-dot" :class="{ pulsing: isRecording }"></span>
             <span class="rec-label">rec</span>
           </div>
@@ -413,19 +426,7 @@ watch(answerText, async () => {
         </div>
       </div>
 
-      <!-- Row 2: Action buttons -->
-      <div class="action-row">
-        <button class="action-btn indigo" @click="answerQuestion" :disabled="isAnswering || (!transcriptText.trim() && !isRecording)">
-          <span class="action-icon">☰</span>
-          <span>answer question</span>
-        </button>
-        <button class="action-btn green" @click="analyzeScreen" :disabled="isAnswering">
-          <span class="action-icon">◻</span>
-          <span>analyze screen</span>
-        </button>
-      </div>
-
-      <!-- Row 3: Transcript row -->
+      <!-- Row 3: Transcript row 
       <div class="transcript-row">
         <div class="transcript-text">
           <span v-if="transcriptText">{{ transcriptText }}</span>
@@ -434,6 +435,7 @@ watch(answerText, async () => {
         </div>
         <button class="clear-btn" @click="clearTranscript" v-if="transcriptText" title="Clear transcript">clear</button>
       </div>
+      -->
 
       <!-- Status message -->
       <div class="status-msg" v-if="statusMsg">{{ statusMsg }}</div>
@@ -501,31 +503,25 @@ watch(answerText, async () => {
   overflow: hidden;
 }
 
-/* ── Row 1: Top bar ── */
-.top-row {
-  height: 34px;
+/* ── Single Row ── */
+.single-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  padding: 6px 10px;
 }
 
-.drag-handle {
-  -webkit-app-region: drag;
-  flex: 1;
-  color: var(--text-hint);
-  font-size: 14px;
-  letter-spacing: 3px;
-  cursor: grab;
-  padding: 4px 0;
-}
-
-.top-right {
-  -webkit-app-region: no-drag;
+.left-actions, .right-actions {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.drag-space {
+  -webkit-app-region: drag;
+  flex: 1;
+  height: 26px;
+  cursor: grab;
 }
 
 .rec-pill {
@@ -535,27 +531,50 @@ watch(answerText, async () => {
   gap: 6px;
   padding: 3px 10px 3px 8px;
   border-radius: 20px;
-  background: rgba(239, 68, 68, 0.10);
-  border: 1px solid rgba(239, 68, 68, 0.20);
   cursor: pointer;
   transition: all 0.2s ease;
 }
 
-.rec-pill:hover {
-  background: rgba(239, 68, 68, 0.18);
+.rec-pill.inactive {
+  background: rgba(16, 185, 129, 0.10);
+  border: 1px solid rgba(16, 185, 129, 0.20);
+}
+
+.rec-pill.inactive:hover {
+  background: rgba(16, 185, 129, 0.18);
+}
+
+.rec-pill.inactive .rec-dot {
+  background: var(--green);
+  opacity: 1;
+}
+
+.rec-pill.inactive .rec-label {
+  color: var(--green);
 }
 
 .rec-pill.active {
   background: rgba(239, 68, 68, 0.16);
-  border-color: rgba(239, 68, 68, 0.35);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.rec-pill.active:hover {
+  background: rgba(239, 68, 68, 0.22);
+}
+
+.rec-pill.active .rec-dot {
+  background: var(--red);
+  opacity: 0.4;
+}
+
+.rec-pill.active .rec-label {
+  color: var(--red);
 }
 
 .rec-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--red);
-  opacity: 0.4;
   flex-shrink: 0;
 }
 
@@ -567,7 +586,6 @@ watch(answerText, async () => {
 .rec-label {
   font-size: 11px;
   font-weight: 500;
-  color: var(--red);
   text-transform: lowercase;
 }
 
@@ -597,24 +615,18 @@ watch(answerText, async () => {
   background: rgba(239, 68, 68, 0.12);
 }
 
-/* ── Row 2: Action buttons ── */
-.action-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-}
+
 
 .action-btn {
   -webkit-app-region: no-drag;
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 32px;
-  padding: 0 16px;
+  height: 26px;
+  padding: 0 12px;
   border: none;
   border-radius: 8px;
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.15s ease;
@@ -781,7 +793,7 @@ watch(answerText, async () => {
 
 .answer-body {
   padding: 10px 12px;
-  max-height: 260px;
+  max-height: 600px;
   overflow-y: auto;
   user-select: text;
 }

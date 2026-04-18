@@ -637,7 +637,7 @@ function createWindow() {
   const primaryDisplay = screen.getPrimaryDisplay();
   const workArea = primaryDisplay.workAreaSize;
   const winWidth = 720;
-  const winHeight = 110; // compact initial height, will auto-resize
+  const winHeight = 50; // extremely compact single row, will auto-resize
   const xPos = Math.round((workArea.width - winWidth) / 2);
   const yPos = 12; // small gap from top edge
 
