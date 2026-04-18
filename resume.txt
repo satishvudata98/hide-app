@@ -1,0 +1,54 @@
+Satish Vudata
+Bengaluru | 8639952675 | satishvudata98@gmail.com
+
+--------------------------------------------------------------------------------
+
+SUMMARY
+Software Developer with 3+ years of experience in scalable web applications
+Strong in Vue.js, JavaScript, and component-based UI development
+Hands-on experience with LLMs, RAG workflows, and AI-powered applications
+Skilled in API integration, performance optimization, and clean architecture
+
+--------------------------------------------------------------------------------
+
+TECHNICAL SKILLS
+Languages: JavaScript, TypeScript, Python
+Frontend: Vue.js, React.js, Vuetify, Pinia, Bootstrap
+Backend: Node.js
+Databases: PostgreSQL, MySQL, SQLite
+APIs: REST APIs
+AI/LLM: LangChain, RAG, Hugging Face, OpenAI APIs, Ollama, Vector DBs
+Tools: Git, Electron.js
+
+--------------------------------------------------------------------------------
+
+EXPERIENCE
+
+Member Technical Staff – Sharp Software Development India (Bengaluru)
+Nov 2023 – Present
+- Built scalable web apps using Vue.js, TypeScript, and modern UI frameworks
+- Developed reusable components and responsive UI with Vuetify
+- Designed and integrated REST APIs using Node.js
+- Built LLM-powered 3D AI avatar for voice/text-based support
+- Implemented RAG-based workflows for contextual AI responses
+- Worked in Linux environments with clean architecture and Agile practices
+
+Front-End Developer – Delta Technology & Management Services (Hyderabad)
+Jun 2022 – Jul 2023
+- Developed interactive web apps using Vue.js and JavaScript
+- Built dynamic UI components with Vuetify
+- Integrated REST APIs and managed state using Vuex
+- Collaborated with design teams for responsive UI/UX improvements
+
+--------------------------------------------------------------------------------
+
+EDUCATION
+B.Tech in Electronics and Communication
+SRK Institute of Technology
+
+--------------------------------------------------------------------------------
+
+KEY HIGHLIGHTS
+Experience in LLM integration and AI workflows
+Strong frontend + backend integration skills
+Focus on scalable, maintainable, production-ready systems

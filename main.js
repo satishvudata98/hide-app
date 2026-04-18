@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const fs = require('fs');
 const {
   app,
   BrowserWindow,
@@ -239,22 +240,71 @@ function configureCapturePermissions() {
   );
 }
 
+const EXPERT_SYSTEM_PROMPT = `You are an expert technical interview assistant.
+
+Step 1: Transcribe the audio/query exactly.
+Step 2: Answer the interview question clearly and naturally.
+
+Guidelines:
+- Tailor the answer to the provided Job Description and Resume
+- Focus on relevant technologies mentioned in the JD
+- Answer like a real candidate (not robotic)
+- Be concise but include key technical depth
+- Use examples where helpful
+- If coding/technical, explain reasoning step-by-step briefly
+- If the question relates to a technology, align the answer with the candidate's experience from the resume
+- Avoid generic textbook answers
+- Prefer practical, real-world explanations
+
+Output format:
+1. Transcription
+2. Answer`;
+
+function getContextFiles() {
+  let jd = '';
+  let resume = '';
+
+  const baseDir = app.isPackaged ? path.dirname(app.getPath('exe')) : __dirname;
+
+  try {
+    const jdPath = path.join(baseDir, 'jd.txt');
+    if (fs.existsSync(jdPath)) jd = fs.readFileSync(jdPath, 'utf8');
+  } catch (e) {
+    console.warn('Failed to read jd.txt', e);
+  }
+
+  try {
+    const resumePath = path.join(baseDir, 'resume.txt');
+    if (fs.existsSync(resumePath)) resume = fs.readFileSync(resumePath, 'utf8');
+  } catch (e) {
+    console.warn('Failed to read resume.txt', e);
+  }
+
+  return { jd, resume };
+}
+
+function buildExpertUserContent(userText) {
+  const { jd, resume } = getContextFiles();
+  let content = '';
+  if (jd) content += `Job Description:\n${jd}\n\n`;
+  if (resume) content += `Candidate Resume:\n${resume}\n\n`;
+  content += `User Prompt:\n${userText || 'Transcribe and answer the question'}`;
+  return content;
+}
+
 function createTextRequestBody(systemPrompt, userText) {
   return {
     model: 'gpt-4o',
     stream: true,
-    temperature: 0.3,
+    temperature: 0.2,
     messages: [
       {
         role: 'system',
-        content:
-          systemPrompt && systemPrompt.trim()
-            ? systemPrompt.trim()
-            : 'You are a fast desktop assistant. Answer concisely and clearly.'
+        content: EXPERT_SYSTEM_PROMPT
       },
       {
         role: 'user',
-        content: userText
+        content: buildExpertUserContent(userText)
       }
     ]
   };
@@ -264,22 +314,19 @@ function createVisionRequestBody(systemPrompt, userText, imageBase64) {
   return {
     model: 'gpt-4o',
     stream: true,
-    temperature: 0.3,
+    temperature: 0.2,
     max_tokens: 1024,
     messages: [
       {
         role: 'system',
-        content:
-          systemPrompt && systemPrompt.trim()
-            ? systemPrompt.trim()
-            : 'You are a fast desktop assistant. Analyze the screenshot and answer concisely. Use bullet points for structured answers.'
+        content: EXPERT_SYSTEM_PROMPT
       },
       {
         role: 'user',
         content: [
           {
             type: 'text',
-            text: userText || 'Analyze this screenshot and describe what you see. If there is a question visible, answer it.'
+            text: buildExpertUserContent(userText || 'Analyze this screenshot and answer the question visible.')
           },
           {
             type: 'image_url',
@@ -303,18 +350,14 @@ function createAudioRequestBody(prompt, audioBase64, format) {
     messages: [
       {
         role: 'system',
-        content:
-          'You are a fast desktop assistant. First transcribe the audio faithfully. Then answer the user prompt clearly. Keep the response concise and easy to read.'
+        content: EXPERT_SYSTEM_PROMPT
       },
       {
         role: 'user',
         content: [
           {
             type: 'text',
-            text:
-              prompt && prompt.trim()
-                ? prompt.trim()
-                : 'Transcribe the recording and respond with a concise helpful answer.'
+            text: buildExpertUserContent(prompt)
           },
           {
             type: 'input_audio',
@@ -593,7 +636,7 @@ function createWindow() {
   // Position window top-center of primary display
   const primaryDisplay = screen.getPrimaryDisplay();
   const workArea = primaryDisplay.workAreaSize;
-  const winWidth = 580;
+  const winWidth = 720;
   const winHeight = 110; // compact initial height, will auto-resize
   const xPos = Math.round((workArea.width - winWidth) / 2);
   const yPos = 12; // small gap from top edge

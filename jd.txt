@@ -1,0 +1,15 @@
+
+Vue JS with JavaScript - 3 - 5 years of experience working professionally as a Software Developer building web application
+Proficiency in JavaScript, ES6, and TypeScript.
+Experience with Node.js and at least one modern web framework (Vue, Angular, or React).
+Strong understanding of Object-Oriented Design principles.
+Working knowledge of Linux OS.
+Highly Desired Skills
+
+Expertise in Vue.js, TypeScript, and UI component development.
+Responsive web design and building responsive websites.
+API development and data visualization.
+Unit testing (Vitest, Jest) and E2E testing (Playwright, Cypress).
+Familiarity with CI/CD processes and tools.
+Agile methodologies (Scrum, Kanban).
+Experience with open-source contributions and remote team collaboration.
