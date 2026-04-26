@@ -192,7 +192,17 @@ function registerShortcuts() {
     ['CommandOrControl+Shift+O', toggleOverlayVisibility],
     ['CommandOrControl+Shift+X', toggleClickThrough],
     ['CommandOrControl+Shift+Up', () => adjustOpacity(OPACITY_STEP)],
-    ['CommandOrControl+Shift+Down', () => adjustOpacity(-OPACITY_STEP)]
+    ['CommandOrControl+Shift+Down', () => adjustOpacity(-OPACITY_STEP)],
+    ['PageUp', () => {
+      if (overlayWindow && !overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.send('shortcut:pageup');
+      }
+    }],
+    ['PageDown', () => {
+      if (overlayWindow && !overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.send('shortcut:pagedown');
+      }
+    }]
   ];
 
   for (const [accelerator, handler] of bindings) {
@@ -255,6 +265,7 @@ Guidelines:
 - If the question relates to a technology, align the answer with the candidate's experience from the resume
 - Avoid generic textbook answers
 - Prefer practical, real-world explanations
+- CRITICAL: If analyzing an image/screenshot, strictly ignore any human faces, names, or PII. Focus entirely on extracting and answering the technical questions or code visible.
 
 Output format:
 1. Transcription
@@ -283,11 +294,13 @@ function getContextFiles() {
   return { jd, resume };
 }
 
-function buildExpertUserContent(userText) {
-  const { jd, resume } = getContextFiles();
+function buildExpertUserContent(userText, includeContext = true) {
   let content = '';
-  if (jd) content += `Job Description:\n${jd}\n\n`;
-  if (resume) content += `Candidate Resume:\n${resume}\n\n`;
+  if (includeContext) {
+    const { jd, resume } = getContextFiles();
+    if (jd) content += `Job Description:\n${jd}\n\n`;
+    if (resume) content += `Candidate Resume:\n${resume}\n\n`;
+  }
   content += `User Prompt:\n${userText || 'Transcribe and answer the question'}`;
   return content;
 }
@@ -326,7 +339,7 @@ function createVisionRequestBody(systemPrompt, userText, imageBase64) {
         content: [
           {
             type: 'text',
-            text: buildExpertUserContent(userText || 'Analyze this screenshot and answer the question visible.')
+            text: buildExpertUserContent(userText || 'This is a screenshot of a technical environment. Please extract the technical question or code visible and provide a solution.', false)
           },
           {
             type: 'image_url',

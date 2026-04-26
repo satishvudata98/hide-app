@@ -18,6 +18,7 @@ Guidelines:
 - If the question relates to a technology, align the answer with the candidate's experience from the resume
 - Avoid generic textbook answers
 - Prefer practical, real-world explanations
+- CRITICAL: If analyzing an image/screenshot, strictly ignore any human faces, names, or PII. Focus entirely on extracting and answering the technical questions or code visible.
 
 Output format:
 1. Transcription
@@ -314,6 +315,13 @@ function clearTranscript() {
   transcriptText.value = ''
 }
 
+// ── Clear audio ──
+function clearAudio() {
+  audioChunks = []
+  statusMsg.value = 'Audio cleared.'
+  setTimeout(() => { if (statusMsg.value === 'Audio cleared.') statusMsg.value = '' }, 2000)
+}
+
 // ── Exit ──
 function quitApp() {
   if (window.overlayApi) window.overlayApi.quitApp()
@@ -367,6 +375,18 @@ onMounted(() => {
     appState.value = 'idle'
   })
 
+  if (window.overlayApi.onShortcutPageUp) {
+    window.overlayApi.onShortcutPageUp(() => {
+      if (isRecording.value) stopRecording()
+      else startRecording()
+    })
+    window.overlayApi.onShortcutPageDown(() => {
+      if (!isAnswering.value && (transcriptText.value.trim() || isRecording.value)) {
+        answerQuestion()
+      }
+    })
+  }
+
   // Observe root element to auto-resize window
   nextTick(() => {
     if (rootEl.value) {
@@ -418,6 +438,7 @@ watch(answerText, async () => {
         <div class="drag-space" title="Drag to move"></div>
 
         <div class="right-actions">
+          <button class="icon-btn" v-if="isRecording" @click="clearAudio" title="Clear recorded audio">↺</button>
           <div class="rec-pill" :class="isRecording ? 'active' : 'inactive'" @click="isRecording ? stopRecording() : startRecording()">
             <span class="rec-dot" :class="{ pulsing: isRecording }"></span>
             <span class="rec-label">rec</span>
@@ -793,7 +814,7 @@ watch(answerText, async () => {
 
 .answer-body {
   padding: 10px 12px;
-  max-height: 600px;
+  max-height: 510px;
   overflow-y: auto;
   user-select: text;
 }

@@ -22,5 +22,7 @@ contextBridge.exposeInMainWorld('overlayApi', {
   onOpenAiStarted: (callback) => subscribe('openai:started', callback),
   onOpenAiDelta: (callback) => subscribe('openai:delta', callback),
   onOpenAiDone: (callback) => subscribe('openai:done', callback),
-  onOpenAiError: (callback) => subscribe('openai:error', callback)
+  onOpenAiError: (callback) => subscribe('openai:error', callback),
+  onShortcutPageUp: (callback) => subscribe('shortcut:pageup', callback),
+  onShortcutPageDown: (callback) => subscribe('shortcut:pagedown', callback)
 });
