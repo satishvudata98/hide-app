@@ -37,6 +37,7 @@ const responseLatency = ref(null)
 const copied = ref(false)
 const recordingSeconds = ref(0)
 const answerError = ref('')
+const liveTranscript = ref('')
 
 let requestId = null
 let answerTimer = null
@@ -129,6 +130,25 @@ function arrayBufferToBase64(buffer) {
   })
 }
 
+// Downsample Float32 mono → PCM16 at 24kHz → base64 (sync, for realtime streaming)
+function floatToPcm16Base64(float32Array, sourceRate) {
+  const ratio = sourceRate / 24000
+  const targetLen = Math.floor(float32Array.length / ratio)
+  const pcm16 = new Int16Array(targetLen)
+  for (let i = 0; i < targetLen; i++) {
+    const start = Math.floor(i * ratio)
+    const end = Math.floor((i + 1) * ratio)
+    let sum = 0, count = 0
+    for (let j = start; j < end && j < float32Array.length; j++) { sum += float32Array[j]; count++ }
+    const s = count ? sum / count : 0
+    pcm16[i] = Math.max(-32768, Math.min(32767, s < 0 ? s * 32768 : s * 32767))
+  }
+  const bytes = new Uint8Array(pcm16.buffer)
+  let binary = ''
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCodePoint(bytes[i])
+  return btoa(binary)
+}
+
 let micStream = null
 let audioContext = null
 let processor = null
@@ -143,6 +163,7 @@ async function startRecording() {
   }
 
   transcriptText.value = ''
+  liveTranscript.value = ''
   answerText.value = ''
   detectedQuestion.value = ''
   showAnswer.value = false
@@ -167,10 +188,18 @@ async function startRecording() {
     const source = audioContext.createMediaStreamSource(micStream)
     source.connect(processor)
 
+    // Open realtime WS session — audio queued in main until WS opens
+    window.overlayApi?.startRealtimeSession({ apiKey: apiKey.value }).catch((err) => {
+      console.warn('[realtime] session start failed, will fall back to Whisper:', err.message)
+    })
+
+    const captureRate = audioContext.sampleRate
+
     processor.onaudioprocess = (e) => {
-      if (appState.value === 'recording') {
-        audioChunks.push(mixToMono(e.inputBuffer))
-      }
+      if (appState.value !== 'recording') return
+      const mono = mixToMono(e.inputBuffer)
+      audioChunks.push(mono) // retained for Whisper fallback
+      window.overlayApi?.sendRealtimeAudioChunk({ audioBase64: floatToPcm16Base64(mono, captureRate) })
     }
 
     appState.value = 'recording'
@@ -181,13 +210,19 @@ async function startRecording() {
   }
 }
 
-function stopRecording() {
+function stopAudioCapture() {
   if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null }
   if (processor) { processor.disconnect(); processor = null }
   if (silenceGain) { silenceGain.disconnect(); silenceGain = null }
   if (audioContext) { audioContext.close().catch(() => {}); audioContext = null }
+}
+
+function stopRecording() {
+  stopAudioCapture()
   if (appState.value === 'recording') appState.value = 'idle'
+  liveTranscript.value = ''
+  window.overlayApi?.closeRealtimeSession()
 }
 
 // ── Answer Question ──
@@ -207,11 +242,27 @@ async function answerQuestion() {
   let capturedSampleRate = 48000
 
   if (appState.value === 'recording') {
-    // Capture sampleRate BEFORE stopRecording nulls audioContext
     capturedSampleRate = audioContext?.sampleRate || 48000
-    stopRecording()
+    stopAudioCapture()
+    appState.value = 'idle'
+    liveTranscript.value = ''
 
-    if (audioChunks.length > 0) {
+    // Commit realtime buffer and wait up to 3s for final transcript
+    statusMsg.value = 'Finalizing transcript...'
+    try {
+      const result = await window.overlayApi.stopRealtimeSession()
+      window.overlayApi.closeRealtimeSession()
+      const transcribed = result?.transcript?.trim() || ''
+      if (transcribed) {
+        transcriptText.value = transcribed
+      }
+    } catch (err) {
+      window.overlayApi?.closeRealtimeSession()
+      console.warn('[realtime] transcript unavailable, falling back to Whisper:', err.message)
+    }
+
+    // Whisper fallback if realtime produced no transcript
+    if (!transcriptText.value.trim() && audioChunks.length > 0) {
       statusMsg.value = 'Processing audio...'
       const merged = mergeChunks(audioChunks)
       const downsampled = downsample(merged, capturedSampleRate, 16000)
@@ -289,7 +340,7 @@ async function answerQuestion() {
         apiKey: apiKey.value,
         transcribedText: text,
         format: 'text',
-        conversationHistory: conversationHistory.value
+        conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value))
       })
     }
   }
@@ -460,6 +511,18 @@ onMounted(() => {
     appState.value = 'idle'
   })
 
+  if (window.overlayApi.onRealtimeTranscriptDelta) {
+    window.overlayApi.onRealtimeTranscriptDelta((p) => {
+      liveTranscript.value = p.displayText || ''
+    })
+    window.overlayApi.onRealtimeTranscriptDone((p) => {
+      liveTranscript.value = p.transcript || ''
+    })
+    window.overlayApi.onRealtimeError((p) => {
+      console.warn('[realtime] error:', p.message)
+    })
+  }
+
   if (window.overlayApi.onShortcutPageUp) {
     window.overlayApi.onShortcutPageUp(() => {
       if (isRecording.value) stopRecording()
@@ -487,11 +550,17 @@ onUnmounted(() => {
   if (resizeObserver) resizeObserver.disconnect()
 })
 
-watch([answerText, showAnswer, transcriptText, appState, statusMsg], () => {
+watch([answerText, showAnswer, transcriptText, appState, statusMsg, liveTranscript], () => {
   nextTick(() => syncWindowHeight())
 })
 
 const answerBodyEl = ref(null)
+const liveTextEl = ref(null)
+
+watch(liveTranscript, async () => {
+  await nextTick()
+  if (liveTextEl.value) liveTextEl.value.scrollLeft = liveTextEl.value.scrollWidth
+})
 
 watch(renderedAnswer, async () => {
   await nextTick()
@@ -538,6 +607,12 @@ watch(renderedAnswer, async () => {
 
       <!-- Status message -->
       <div class="status-msg" v-if="statusMsg">{{ statusMsg }}</div>
+
+      <!-- Live transcript while recording -->
+      <div class="live-transcript" v-if="isRecording && liveTranscript">
+        <span class="live-dot"></span>
+        <div class="live-text" ref="liveTextEl">{{ liveTranscript }}</div>
+      </div>
 
       <!-- API key input — shown when no key is set -->
       <div class="key-row" v-if="showKeyInput">
@@ -832,6 +907,34 @@ watch(renderedAnswer, async () => {
   font-size: 10px;
   color: var(--text-hint);
   border-top: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+/* ── Live transcript ── */
+.live-transcript {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+}
+
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+  flex-shrink: 0;
+  animation: pulse-red 1.2s ease-in-out infinite;
+}
+
+.live-text {
+  font-size: 11px;
+  color: var(--text-hint);
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow-x: hidden;
+  flex: 1;
 }
 
 /* ═══════════════════════════════════════════

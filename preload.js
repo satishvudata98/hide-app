@@ -27,5 +27,12 @@ contextBridge.exposeInMainWorld('overlayApi', {
   onOpenAiDone: (callback) => subscribe('openai:done', callback),
   onOpenAiError: (callback) => subscribe('openai:error', callback),
   onShortcutPageUp: (callback) => subscribe('shortcut:pageup', callback),
-  onShortcutPageDown: (callback) => subscribe('shortcut:pagedown', callback)
+  onShortcutPageDown: (callback) => subscribe('shortcut:pagedown', callback),
+  startRealtimeSession: (payload) => ipcRenderer.invoke('realtime:start', payload),
+  sendRealtimeAudioChunk: (payload) => ipcRenderer.send('realtime:audio-chunk', payload),
+  stopRealtimeSession: () => ipcRenderer.invoke('realtime:stop'),
+  closeRealtimeSession: () => ipcRenderer.send('realtime:close'),
+  onRealtimeTranscriptDelta: (cb) => subscribe('realtime:transcript-delta', cb),
+  onRealtimeTranscriptDone: (cb) => subscribe('realtime:transcript-done', cb),
+  onRealtimeError: (cb) => subscribe('realtime:error', cb)
 });

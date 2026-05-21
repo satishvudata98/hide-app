@@ -2,6 +2,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const WebSocket = require('ws');
 const {
   app,
   BrowserWindow,
@@ -35,6 +36,12 @@ let isClickThrough = false;
 let currentOpacity = 1.0;
 
 const activeRequests = new Map(); // requestId → AbortController
+
+let realtimeWs = null;
+let realtimeConfirmedTranscript = '';
+let realtimeDraftTranscript = '';
+let realtimeAudioQueue = [];
+let realtimeStopResolver = null;
 
 function getSettingsPath() {
   return path.join(app.getPath('userData'), 'screnshield-settings.json');
@@ -703,6 +710,151 @@ function registerIpcHandlers() {
     } catch (error) {
       return { text: '', error: error.message || 'Whisper transcription error.' };
     }
+  });
+
+  // ── Realtime transcription via OpenAI Realtime API (WebSocket) ──
+  ipcMain.handle('realtime:start', (_event, { apiKey }) => {
+    if (realtimeWs) {
+      try { realtimeWs.close(); } catch {}
+      realtimeWs = null;
+    }
+    realtimeConfirmedTranscript = '';
+    realtimeDraftTranscript = '';
+    realtimeAudioQueue = [];
+    realtimeStopResolver = null;
+    console.log('[realtime] starting session...');
+
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket('wss://api.openai.com/v1/realtime?intent=transcription', {
+        headers: {
+          Authorization: `Bearer ${apiKey}`
+        }
+      });
+
+      realtimeWs = ws;
+
+      const openTimeout = setTimeout(() => {
+        ws.terminate();
+        reject(new Error('Realtime WebSocket connection timed out.'));
+      }, 10000);
+
+      ws.on('open', () => {
+        clearTimeout(openTimeout);
+        console.log('[realtime] WebSocket connected, configuring session');
+        ws.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            type: 'transcription',
+            audio: {
+              input: {
+                transcription: {
+                  model: 'gpt-4o-transcribe',
+                  language: 'en'
+                }
+              }
+            }
+          }
+        }));
+        for (const chunk of realtimeAudioQueue) {
+          ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: chunk }));
+        }
+        realtimeAudioQueue = [];
+        resolve({ ok: true });
+      });
+
+      ws.on('message', (data) => {
+        let event;
+        try { event = JSON.parse(data.toString()); } catch { return; }
+
+        // Log every event so we can see the exact schema
+        console.log('[realtime] event:', event.type, event.error ? JSON.stringify(event.error) : '');
+
+        if (event.type === 'session.created' || event.type === 'session.updated') {
+          console.log('[realtime] session object:', JSON.stringify(event.session));
+        }
+
+        if (event.type === 'conversation.item.added' || event.type === 'conversation.item.done') {
+          console.log('[realtime] item:', JSON.stringify(event.item));
+        }
+
+        if (event.type === 'error') {
+          console.error('[realtime] API error:', JSON.stringify(event.error));
+          emitToRenderer('realtime:error', { message: event.error?.message || 'Realtime API error' });
+        }
+
+        if (event.type === 'conversation.item.input_audio_transcription.delta') {
+          realtimeDraftTranscript += event.delta || '';
+          emitToRenderer('realtime:transcript-delta', {
+            delta: event.delta,
+            displayText: realtimeConfirmedTranscript + realtimeDraftTranscript
+          });
+        }
+
+        if (event.type === 'conversation.item.input_audio_transcription.completed') {
+          realtimeConfirmedTranscript += (event.transcript || '') + ' ';
+          realtimeDraftTranscript = '';
+          const full = realtimeConfirmedTranscript.trim();
+          emitToRenderer('realtime:transcript-done', { transcript: full });
+          if (realtimeStopResolver) {
+            realtimeStopResolver(full);
+            realtimeStopResolver = null;
+          }
+        }
+      });
+
+      ws.on('error', (err) => {
+        console.error('[realtime] WebSocket error:', err.message);
+        emitToRenderer('realtime:error', { message: err.message });
+        reject(err);
+      });
+
+      ws.on('close', () => {
+        clearTimeout(openTimeout);
+        if (realtimeWs === ws) realtimeWs = null;
+        if (realtimeStopResolver) {
+          realtimeStopResolver((realtimeConfirmedTranscript + realtimeDraftTranscript).trim());
+          realtimeStopResolver = null;
+        }
+      });
+    });
+  });
+
+  ipcMain.on('realtime:audio-chunk', (_event, { audioBase64 }) => {
+    if (!realtimeWs) return;
+    if (realtimeWs.readyState === WebSocket.OPEN) {
+      realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: audioBase64 }));
+    } else if (realtimeWs.readyState === WebSocket.CONNECTING) {
+      realtimeAudioQueue.push(audioBase64);
+    }
+  });
+
+  ipcMain.handle('realtime:stop', () => {
+    return new Promise((resolve) => {
+      if (!realtimeWs || realtimeWs.readyState !== WebSocket.OPEN) {
+        resolve({ transcript: (realtimeConfirmedTranscript + realtimeDraftTranscript).trim() });
+        return;
+      }
+      realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+      const timeout = setTimeout(() => {
+        realtimeStopResolver = null;
+        resolve({ transcript: (realtimeConfirmedTranscript + realtimeDraftTranscript).trim() });
+      }, 3000);
+      realtimeStopResolver = (transcript) => {
+        clearTimeout(timeout);
+        resolve({ transcript });
+      };
+    });
+  });
+
+  ipcMain.on('realtime:close', () => {
+    realtimeStopResolver = null;
+    if (realtimeWs) {
+      try { realtimeWs.close(); } catch {}
+      realtimeWs = null;
+    }
+    realtimeConfirmedTranscript = '';
+    realtimeDraftTranscript = '';
+    realtimeAudioQueue = [];
   });
 }
 
