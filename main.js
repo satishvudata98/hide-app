@@ -34,6 +34,28 @@ let overlayWindow = null;
 let isClickThrough = false;
 let currentOpacity = 1.0;
 
+const activeRequests = new Map(); // requestId → AbortController
+
+function getSettingsPath() {
+  return path.join(app.getPath('userData'), 'screnshield-settings.json');
+}
+
+function readSettings() {
+  try {
+    const p = getSettingsPath();
+    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {}
+  return {};
+}
+
+function writeSettings(updates) {
+  try {
+    const p = getSettingsPath();
+    const current = readSettings();
+    fs.writeFileSync(p, JSON.stringify({ ...current, ...updates }, null, 2), 'utf8');
+  } catch {}
+}
+
 const user32 = isWindows && ffi
   ? ffi.Library('user32', {
     SetWindowDisplayAffinity: ['bool', ['pointer', 'uint32']]
@@ -250,26 +272,25 @@ function configureCapturePermissions() {
   );
 }
 
-const EXPERT_SYSTEM_PROMPT = `You are an expert technical interview assistant.
+const EXPERT_SYSTEM_PROMPT = `You are an expert technical interview assistant. Answer as a real, experienced candidate — practical, specific, confident.
 
-Step 1: Transcribe the audio/query exactly.
-Step 2: Answer the interview question clearly and naturally.
+OUTPUT FORMAT (strict markdown):
+## Answer
+Direct, confident answer in 1-3 sentences.
 
-Guidelines:
-- Tailor the answer to the provided Job Description and Resume
-- Focus on relevant technologies mentioned in the JD
-- Answer like a real candidate (not robotic)
-- Be concise but include key technical depth
-- Use examples where helpful
-- If coding/technical, explain reasoning step-by-step briefly
-- If the question relates to a technology, align the answer with the candidate's experience from the resume
-- Avoid generic textbook answers
-- Prefer practical, real-world explanations
-- CRITICAL: If analyzing an image/screenshot, strictly ignore any human faces, names, or PII. Focus entirely on extracting and answering the technical questions or code visible.
+## Key Points
+- 2-4 most important supporting details
+- Tie to the candidate's actual experience from their resume where relevant
 
-Output format:
-1. Transcription
-2. Answer`;
+## Code Example
+Only include for coding/technical questions. Fenced code block with correct language tag. Under 20 lines.
+
+RULES:
+- Skip sections that are not relevant (no Code Example for behavioral questions)
+- Align with job description requirements and candidate resume skills
+- Never use generic textbook explanations — prefer real-world examples
+- Never mention being an AI or assistant
+- For screen/image analysis: focus only on code and technical questions visible; ignore faces and PII`;
 
 function getContextFiles() {
   let jd = '';
@@ -305,7 +326,7 @@ function buildExpertUserContent(userText, includeContext = true) {
   return content;
 }
 
-function createTextRequestBody(systemPrompt, userText) {
+function createTextRequestBody(systemPrompt, userText, conversationHistory = []) {
   return {
     model: 'gpt-4o',
     stream: true,
@@ -315,6 +336,7 @@ function createTextRequestBody(systemPrompt, userText) {
         role: 'system',
         content: EXPERT_SYSTEM_PROMPT
       },
+      ...conversationHistory.slice(-4),
       {
         role: 'user',
         content: buildExpertUserContent(userText)
@@ -504,12 +526,12 @@ async function runOpenAiRequest(sender, payload) {
   const imageBase64 = payload?.imageBase64;
   const prompt = payload?.prompt || '';
   const format = payload?.format || 'wav';
+  const conversationHistory = Array.isArray(payload?.conversationHistory) ? payload.conversationHistory : [];
 
   if (!apiKey) {
     throw new Error('Enter your OpenAI API key before sending.');
   }
 
-  // Determine request type: vision, text, or audio
   const isVisionRequest = !!imageBase64;
   const isTextRequest = format === 'text' && transcribedText;
 
@@ -523,31 +545,54 @@ async function runOpenAiRequest(sender, payload) {
   if (isVisionRequest) {
     requestBody = createVisionRequestBody(prompt, transcribedText || '', imageBase64);
   } else if (isTextRequest) {
-    requestBody = createTextRequestBody(prompt, transcribedText);
+    requestBody = createTextRequestBody(prompt, transcribedText, conversationHistory);
   } else {
     requestBody = createAudioRequestBody(prompt, audioBase64, format);
   }
 
-  const response = await fetch(OPENAI_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(requestBody)
-  });
+  const controller = new AbortController();
+  activeRequests.set(requestId, controller);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenAI request failed (${response.status}): ${errorText}`);
+  let timedOut = false;
+  const timeoutId = setTimeout(() => { timedOut = true; controller.abort(); }, 60_000);
+
+  console.log(`[openai] request started: ${requestId}`);
+
+  try {
+    const response = await fetch(OPENAI_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    console.log(`[openai] response: ${response.status} ${response.headers.get('content-type')}`);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OpenAI request failed (${response.status}): ${errorText}`);
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    const finalText = contentType.includes('text/event-stream')
+      ? await readStreamedCompletion(response, sender, requestId)
+      : await readNonStreamCompletion(response);
+
+    console.log(`[openai] done: ${finalText.length} chars`);
+    sender.send('openai:done', { requestId, text: finalText || '' });
+  } catch (error) {
+    if (error.name === 'AbortError' && timedOut) {
+      throw new Error('Request timed out (60s). Check your network and try again.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    activeRequests.delete(requestId);
   }
-
-  const contentType = response.headers.get('content-type') || '';
-  const finalText = contentType.includes('text/event-stream')
-    ? await readStreamedCompletion(response, sender, requestId)
-    : await readNonStreamCompletion(response);
-
-  sender.send('openai:done', { requestId, text: finalText || '' });
 }
 
 function registerIpcHandlers() {
@@ -557,11 +602,27 @@ function registerIpcHandlers() {
 
   ipcMain.on('openai:run', (event, payload) => {
     runOpenAiRequest(event.sender, payload).catch((error) => {
+      console.error('[openai] error:', error.message);
+      if (error.name === 'AbortError') return; // user-cancelled
       event.sender.send('openai:error', {
         requestId: payload?.requestId || null,
         message: error.message || 'Unknown OpenAI request error.'
       });
     });
+  });
+
+  ipcMain.on('openai:cancel', (_event, reqId) => {
+    const controller = activeRequests.get(reqId);
+    if (controller) {
+      controller.abort();
+      activeRequests.delete(reqId);
+    }
+  });
+
+  ipcMain.handle('settings:get', (_event, key) => readSettings()[key] ?? null);
+
+  ipcMain.handle('settings:set', (_event, key, value) => {
+    writeSettings({ [key]: value });
   });
 
   // Screen capture for "analyze screen" feature
@@ -648,11 +709,11 @@ function registerIpcHandlers() {
 function createWindow() {
   // Position window top-center of primary display
   const primaryDisplay = screen.getPrimaryDisplay();
-  const workArea = primaryDisplay.workAreaSize;
+  const workArea = primaryDisplay.workArea;
   const winWidth = 720;
   const winHeight = 50; // extremely compact single row, will auto-resize
-  const xPos = Math.round((workArea.width - winWidth) / 2);
-  const yPos = 12; // small gap from top edge
+  const xPos = workArea.x + Math.round((workArea.width - winWidth) / 2);
+  const yPos = workArea.y + 12; // small gap from top edge
 
   overlayWindow = new BrowserWindow({
     width: winWidth,
@@ -692,6 +753,9 @@ function createWindow() {
 
   overlayWindow.webContents.on('did-finish-load', () => {
     emitWindowState();
+    if (!app.isPackaged) {
+      overlayWindow.webContents.openDevTools({ mode: 'detach' });
+    }
   });
 
   overlayWindow.once('ready-to-show', () => {

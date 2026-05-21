@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(\\(Get-Item \"d:\\\\hide-app\"\\).GetDirectories\\(\\) | Select-Object Name)"
+    ]
+  }
+}

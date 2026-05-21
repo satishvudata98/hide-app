@@ -1,48 +1,63 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { marked } from 'marked'
+import hljs from 'highlight.js/lib/core'
+import python from 'highlight.js/lib/languages/python'
+import javascript from 'highlight.js/lib/languages/javascript'
+import java from 'highlight.js/lib/languages/java'
+import typescript from 'highlight.js/lib/languages/typescript'
+import bash from 'highlight.js/lib/languages/bash'
+import sql from 'highlight.js/lib/languages/sql'
+import DOMPurify from 'dompurify'
 
 // ── Config ──
-const API_KEY = import.meta.env.VITE_OPENAI_API_KEY || ''
-const SYSTEM_PROMPT = `You are an expert technical interview assistant.
+const envApiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_OPENAI_apiKey || ''
+const apiKey = ref(envApiKey)
+const apiKeyInput = ref('')
+const showKeyInput = ref(false)
 
-Step 1: Transcribe the audio/query exactly.
-Step 2: Answer the interview question clearly and naturally.
+// ── Register highlight.js languages ──
+hljs.registerLanguage('python', python)
+hljs.registerLanguage('javascript', javascript)
+hljs.registerLanguage('java', java)
+hljs.registerLanguage('typescript', typescript)
+hljs.registerLanguage('bash', bash)
+hljs.registerLanguage('sql', sql)
 
-Guidelines:
-- Tailor the answer to the provided Job Description and Resume
-- Focus on relevant technologies mentioned in the JD
-- Answer like a real candidate (not robotic)
-- Be concise but include key technical depth
-- Use examples where helpful
-- If coding/technical, explain reasoning step-by-step briefly
-- If the question relates to a technology, align the answer with the candidate's experience from the resume
-- Avoid generic textbook answers
-- Prefer practical, real-world explanations
-- CRITICAL: If analyzing an image/screenshot, strictly ignore any human faces, names, or PII. Focus entirely on extracting and answering the technical questions or code visible.
-
-Output format:
-1. Transcription
-2. Answer`
-
-// ── State machine: idle → recording → answering ──
-const appState = ref('idle') // 'idle' | 'recording' | 'answering'
+// ── State machine: idle → recording → transcribing → answering ──
+const appState = ref('idle') // 'idle' | 'recording' | 'transcribing' | 'answering'
 const transcriptText = ref('')
 const answerText = ref('')
 const detectedQuestion = ref('')
 const answerElapsed = ref(0)
 const showAnswer = ref(false)
 const statusMsg = ref('')
+const conversationHistory = ref([]) // last 2 exchanges = 4 messages
+const responseLatency = ref(null)
+const copied = ref(false)
+const recordingSeconds = ref(0)
+const answerError = ref('')
 
 let requestId = null
-let recognition = null
-let recognitionRestarting = false
 let answerTimer = null
 let answerStartTime = 0
 let resizeObserver = null
+let recordingTimer = null
 
 // ── Computed ──
 const isRecording = computed(() => appState.value === 'recording')
-const isAnswering = computed(() => appState.value === 'answering')
+const isAnswering = computed(() => ['transcribing', 'answering'].includes(appState.value))
+
+// ── Markdown rendering ──
+const renderedAnswer = computed(() => {
+  if (!answerText.value) return ''
+  try {
+    const html = marked.parse(answerText.value, { breaks: true, gfm: true })
+    return DOMPurify.sanitize(typeof html === 'string' ? html : '')
+  } catch {
+    return answerText.value.replace(/\n/g, '<br>')
+  }
+})
 
 // ── Audio Helpers ──
 function mixToMono(inputBuffer) {
@@ -119,12 +134,10 @@ let audioContext = null
 let processor = null
 let silenceGain = null
 let audioChunks = []
-let chunkTimer = null
-let isProcessingChunk = false
 
 async function startRecording() {
   if (appState.value !== 'idle') return
-  if (!API_KEY) {
+  if (!apiKey.value) {
     statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
     return
   }
@@ -135,6 +148,7 @@ async function startRecording() {
   showAnswer.value = false
   statusMsg.value = ''
   audioChunks = []
+  recordingSeconds.value = 0
 
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
@@ -145,7 +159,6 @@ async function startRecording() {
     audioContext = new AudioContext()
     processor = audioContext.createScriptProcessor(4096, 1, 1)
 
-    // Silent output to keep processor alive
     silenceGain = audioContext.createGain()
     silenceGain.gain.value = 0
     processor.connect(silenceGain)
@@ -154,7 +167,6 @@ async function startRecording() {
     const source = audioContext.createMediaStreamSource(micStream)
     source.connect(processor)
 
-    // Just accumulate audio, don't send chunks
     processor.onaudioprocess = (e) => {
       if (appState.value === 'recording') {
         audioChunks.push(mixToMono(e.inputBuffer))
@@ -162,6 +174,7 @@ async function startRecording() {
     }
 
     appState.value = 'recording'
+    recordingTimer = setInterval(() => recordingSeconds.value++, 1000)
   } catch (err) {
     statusMsg.value = 'Mic access failed: ' + err.message
     stopRecording()
@@ -169,63 +182,57 @@ async function startRecording() {
 }
 
 function stopRecording() {
-  if (micStream) {
-    micStream.getTracks().forEach(t => t.stop())
-    micStream = null
-  }
-  if (processor) {
-    processor.disconnect()
-    processor = null
-  }
-  if (silenceGain) {
-    silenceGain.disconnect()
-    silenceGain = null
-  }
-  if (audioContext) {
-    audioContext.close().catch(() => {})
-    audioContext = null
-  }
-  if (appState.value === 'recording') {
-    appState.value = 'idle'
-  }
+  if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null }
+  if (processor) { processor.disconnect(); processor = null }
+  if (silenceGain) { silenceGain.disconnect(); silenceGain = null }
+  if (audioContext) { audioContext.close().catch(() => {}); audioContext = null }
+  if (appState.value === 'recording') appState.value = 'idle'
 }
 
 // ── Answer Question ──
 async function answerQuestion() {
-  if (!API_KEY) {
+  if (!apiKey.value) {
     statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
     return
   }
-  
+
+  // Cancel any in-flight request before starting a new one
+  if (requestId && isAnswering.value) {
+    window.overlayApi?.cancelRequest?.(requestId)
+    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+  }
+
   let audioBase64 = null
-  
+  let capturedSampleRate = 48000
+
   if (appState.value === 'recording') {
-    // If we are currently recording, stop and process the full audio
-    statusMsg.value = 'Processing audio...'
+    // Capture sampleRate BEFORE stopRecording nulls audioContext
+    capturedSampleRate = audioContext?.sampleRate || 48000
     stopRecording()
-    
+
     if (audioChunks.length > 0) {
+      statusMsg.value = 'Processing audio...'
       const merged = mergeChunks(audioChunks)
-      const downsampled = downsample(merged, audioContext ? audioContext.sampleRate : 48000, 16000)
+      const downsampled = downsample(merged, capturedSampleRate, 16000)
       const wavBuffer = encodeWav(downsampled, 16000)
       audioBase64 = await arrayBufferToBase64(wavBuffer)
     }
   }
 
   const text = transcriptText.value.trim()
-  
+
   if (!text && !audioBase64) {
     statusMsg.value = 'No transcript or audio to analyze.'
     return
   }
 
-  detectedQuestion.value = audioBase64 ? 'Audio query submitted' : text
   answerText.value = ''
+  answerError.value = ''
   showAnswer.value = true
-  appState.value = 'answering'
   answerStartTime = Date.now()
   answerElapsed.value = 0
-  statusMsg.value = 'Sending to AI...'
+  responseLatency.value = null
 
   answerTimer = setInterval(() => {
     answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
@@ -233,30 +240,71 @@ async function answerQuestion() {
 
   requestId = `req_${Date.now()}`
 
-  if (window.overlayApi) {
-    const payload = {
+  if (audioBase64) {
+    // ── Two-stage: Whisper transcription first, then GPT-4o answer ──
+    appState.value = 'transcribing'
+    statusMsg.value = 'Transcribing...'
+    detectedQuestion.value = ''
+
+    if (!window.overlayApi) return
+
+    const result = await window.overlayApi.transcribeAudio({ apiKey: apiKey.value, audioBase64, format: 'wav' })
+
+    if (result.error) {
+      statusMsg.value = 'Transcription failed: ' + result.error
+      if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+      appState.value = 'idle'
+      return
+    }
+
+    const transcribed = result.text?.trim() || ''
+    if (!transcribed) {
+      statusMsg.value = 'No speech detected. Try again.'
+      if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+      appState.value = 'idle'
+      return
+    }
+
+    transcriptText.value = transcribed
+    detectedQuestion.value = transcribed
+    statusMsg.value = 'Thinking...'
+    appState.value = 'answering'
+
+    window.overlayApi.runOpenAiRequest({
       requestId,
-      apiKey: API_KEY,
-      prompt: SYSTEM_PROMPT,
+      apiKey: apiKey.value,
+      transcribedText: transcribed,
+      format: 'text',
+      conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value))
+    })
+  } else {
+    // ── Text mode ──
+    detectedQuestion.value = text
+    statusMsg.value = 'Thinking...'
+    appState.value = 'answering'
+
+    if (window.overlayApi) {
+      window.overlayApi.runOpenAiRequest({
+        requestId,
+        apiKey: apiKey.value,
+        transcribedText: text,
+        format: 'text',
+        conversationHistory: conversationHistory.value
+      })
     }
-    
-    if (audioBase64) {
-      payload.audioBase64 = audioBase64
-      payload.format = 'wav'
-    } else {
-      payload.transcribedText = text
-      payload.format = 'text'
-    }
-    
-    window.overlayApi.runOpenAiRequest(payload)
   }
 }
 
 // ── Analyze Screen ──
 async function analyzeScreen() {
-  if (!API_KEY) {
+  if (!apiKey.value) {
     statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
     return
+  }
+
+  if (requestId && isAnswering.value) {
+    window.overlayApi?.cancelRequest?.(requestId)
+    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
   }
 
   statusMsg.value = 'Capturing screen...'
@@ -272,13 +320,14 @@ async function analyzeScreen() {
     return
   }
 
-  detectedQuestion.value = 'Screen analysis requested'
+  detectedQuestion.value = 'Screen analysis'
   answerText.value = ''
   showAnswer.value = true
   appState.value = 'answering'
   answerStartTime = Date.now()
   answerElapsed.value = 0
-  statusMsg.value = ''
+  responseLatency.value = null
+  statusMsg.value = 'Thinking...'
 
   answerTimer = setInterval(() => {
     answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
@@ -286,15 +335,25 @@ async function analyzeScreen() {
 
   requestId = `req_${Date.now()}`
 
-  if (window.overlayApi) {
-    window.overlayApi.runOpenAiRequest({
-      requestId,
-      apiKey: API_KEY,
-      prompt: SYSTEM_PROMPT,
-      transcribedText: transcriptText.value.trim() || '',
-      imageBase64: result.imageBase64,
-      format: 'text'
-    })
+  window.overlayApi.runOpenAiRequest({
+    requestId,
+    apiKey: apiKey.value,
+    transcribedText: transcriptText.value.trim() || '',
+    imageBase64: result.imageBase64,
+    format: 'text',
+    conversationHistory: conversationHistory.value
+  })
+}
+
+// ── Copy answer ──
+async function copyAnswer() {
+  if (!answerText.value) return
+  try {
+    await navigator.clipboard.writeText(answerText.value)
+    copied.value = true
+    setTimeout(() => { copied.value = false }, 1500)
+  } catch {
+    statusMsg.value = 'Copy failed.'
   }
 }
 
@@ -303,16 +362,10 @@ function closeAnswer() {
   showAnswer.value = false
   answerText.value = ''
   detectedQuestion.value = ''
+  responseLatency.value = null
   if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
   answerElapsed.value = 0
-
-  // Do not resume recording automatically unless they click the record pill
   appState.value = 'idle'
-}
-
-// ── Clear transcript ──
-function clearTranscript() {
-  transcriptText.value = ''
 }
 
 // ── Clear audio ──
@@ -327,29 +380,44 @@ function quitApp() {
   if (window.overlayApi) window.overlayApi.quitApp()
 }
 
-// ── Format answer text to bullet points ──
-const formattedAnswer = computed(() => {
-  if (!answerText.value) return []
-  const lines = answerText.value.split('\n').filter(l => l.trim())
-  return lines.map(line => {
-    // Strip leading bullet markers for uniform rendering
-    return line.replace(/^[\s]*[-•*]\s*/, '').trim()
-  }).filter(l => l)
-})
-
 // ── Dynamic window height ──
 const rootEl = ref(null)
 
 function syncWindowHeight() {
   if (!rootEl.value || !window.overlayApi?.resizeHeight) return
-  // Measure the actual rendered content + some padding
-  const height = rootEl.value.scrollHeight + 24 // 24 for body padding
+  const height = rootEl.value.scrollHeight + 24
   window.overlayApi.resizeHeight(height)
+}
+
+// ── API key persistence ──
+async function loadApiKey() {
+  if (!window.overlayApi?.getSettings) return
+  const stored = await window.overlayApi.getSettings('apiKey')
+  if (stored) {
+    apiKey.value = stored
+    showKeyInput.value = false
+  } else if (!apiKey.value) {
+    showKeyInput.value = true
+  }
+}
+
+async function saveApiKey() {
+  const val = apiKeyInput.value.trim()
+  if (!val) return
+  if (window.overlayApi?.setSettings) {
+    await window.overlayApi.setSettings('apiKey', val)
+  }
+  apiKey.value = val
+  showKeyInput.value = false
+  statusMsg.value = 'API key saved.'
+  setTimeout(() => { if (statusMsg.value === 'API key saved.') statusMsg.value = '' }, 2000)
 }
 
 // ── OpenAI response handlers ──
 onMounted(() => {
   if (!window.overlayApi) return
+
+  loadApiKey()
 
   window.overlayApi.onOpenAiStarted((p) => {
     if (p.requestId !== requestId) return
@@ -359,18 +427,35 @@ onMounted(() => {
   window.overlayApi.onOpenAiDelta((p) => {
     if (p.requestId !== requestId) return
     answerText.value = p.text || ''
+    if (statusMsg.value === 'Thinking...') statusMsg.value = ''
   })
 
   window.overlayApi.onOpenAiDone((p) => {
     if (p.requestId !== requestId) return
-    answerText.value = p.text || answerText.value
+    const finalText = p.text || answerText.value
+    answerText.value = finalText
+    responseLatency.value = ((Date.now() - answerStartTime) / 1000).toFixed(1) + 's'
     if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
-    // Stay in answering state until user closes
+    appState.value = 'idle'
+    if (!finalText) {
+      answerError.value = 'No response received — check your API key or try again.'
+    }
+    if (detectedQuestion.value && finalText) {
+      conversationHistory.value.push(
+        { role: 'user', content: detectedQuestion.value },
+        { role: 'assistant', content: finalText }
+      )
+      if (conversationHistory.value.length > 4) {
+        conversationHistory.value = conversationHistory.value.slice(-4)
+      }
+    }
+    statusMsg.value = ''
   })
 
   window.overlayApi.onOpenAiError((p) => {
     if (p.requestId && p.requestId !== requestId) return
-    statusMsg.value = p.message || 'Request failed.'
+    answerError.value = p.message || 'Request failed.'
+    statusMsg.value = ''
     if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
     appState.value = 'idle'
   })
@@ -387,7 +472,6 @@ onMounted(() => {
     })
   }
 
-  // Observe root element to auto-resize window
   nextTick(() => {
     if (rootEl.value) {
       resizeObserver = new ResizeObserver(() => syncWindowHeight())
@@ -403,25 +487,30 @@ onUnmounted(() => {
   if (resizeObserver) resizeObserver.disconnect()
 })
 
-// Auto-resize whenever answer or transcript changes
 watch([answerText, showAnswer, transcriptText, appState, statusMsg], () => {
   nextTick(() => syncWindowHeight())
 })
 
 const answerBodyEl = ref(null)
-watch(answerText, async () => {
+
+watch(renderedAnswer, async () => {
   await nextTick()
-  if (answerBodyEl.value) answerBodyEl.value.scrollTop = answerBodyEl.value.scrollHeight
+  if (answerBodyEl.value) {
+    // Apply highlight.js to any unhighlighted code blocks
+    answerBodyEl.value.querySelectorAll('pre code:not(.hljs)').forEach(el => {
+      hljs.highlightElement(el)
+    })
+    answerBodyEl.value.scrollTop = answerBodyEl.value.scrollHeight
+  }
 })
 </script>
 
 <template>
   <div class="overlay-root" ref="rootEl">
 
-    <!-- ═══ MAIN OVERLAY BLOCK ═══ -->
+    <!-- ═══ MAIN BAR ═══ -->
     <div class="main-bar">
 
-      <!-- Single Action Row -->
       <div class="single-row">
         <div class="left-actions">
           <button class="action-btn indigo" @click="answerQuestion" :disabled="isAnswering || (!transcriptText.trim() && !isRecording)">
@@ -441,25 +530,26 @@ watch(answerText, async () => {
           <button class="icon-btn" v-if="isRecording" @click="clearAudio" title="Clear recorded audio">↺</button>
           <div class="rec-pill" :class="isRecording ? 'active' : 'inactive'" @click="isRecording ? stopRecording() : startRecording()">
             <span class="rec-dot" :class="{ pulsing: isRecording }"></span>
-            <span class="rec-label">rec</span>
+            <span class="rec-label">{{ isRecording ? recordingSeconds + 's' : 'rec' }}</span>
           </div>
           <button class="icon-btn exit-btn" @click="quitApp" title="Exit">✕</button>
         </div>
       </div>
 
-      <!-- Row 3: Transcript row 
-      <div class="transcript-row">
-        <div class="transcript-text">
-          <span v-if="transcriptText">{{ transcriptText }}</span>
-          <span v-else class="transcript-placeholder">{{ isRecording ? 'listening...' : 'start recording to see transcript' }}</span>
-          <span v-if="isRecording" class="blink-cursor">|</span>
-        </div>
-        <button class="clear-btn" @click="clearTranscript" v-if="transcriptText" title="Clear transcript">clear</button>
-      </div>
-      -->
-
       <!-- Status message -->
       <div class="status-msg" v-if="statusMsg">{{ statusMsg }}</div>
+
+      <!-- API key input — shown when no key is set -->
+      <div class="key-row" v-if="showKeyInput">
+        <input
+          class="key-input"
+          v-model="apiKeyInput"
+          type="password"
+          placeholder="Paste OpenAI API key (sk-…)"
+          @keydown.enter="saveApiKey"
+        />
+        <button class="action-btn indigo key-save-btn" @click="saveApiKey">Save</button>
+      </div>
     </div>
 
     <!-- ═══ CONNECTOR LINE ═══ -->
@@ -471,8 +561,12 @@ watch(answerText, async () => {
         <div class="answer-label">
           <span class="answer-dot"></span>
           <span>ai answer</span>
+          <span class="answer-latency" v-if="responseLatency">· {{ responseLatency }}</span>
         </div>
-        <span class="answer-elapsed" v-if="answerElapsed > 0">{{ answerElapsed }}s</span>
+        <span class="answer-elapsed" v-if="answerElapsed > 0 && !responseLatency">{{ answerElapsed }}s</span>
+        <button class="icon-btn copy-btn" @click="copyAnswer" :title="copied ? 'Copied!' : 'Copy answer'" v-if="answerText">
+          {{ copied ? '✓' : '⎘' }}
+        </button>
         <button class="icon-btn close-btn" @click="closeAnswer" title="Close">✕</button>
       </div>
 
@@ -482,16 +576,16 @@ watch(answerText, async () => {
           "{{ detectedQuestion }}"
         </div>
 
-        <!-- Streaming answer -->
-        <div class="answer-content" v-if="answerText">
-          <div v-for="(line, i) in formattedAnswer" :key="i" class="answer-bullet">
-            <span class="bullet-dot">·</span>
-            <span>{{ line }}</span>
-          </div>
-        </div>
+        <!-- Streaming answer rendered as markdown -->
+        <div class="answer-md" v-if="renderedAnswer" v-html="renderedAnswer"></div>
+
+        <!-- Error state -->
+        <div class="answer-error" v-if="answerError">{{ answerError }}</div>
 
         <!-- Loading state -->
-        <div class="answer-loading" v-if="!answerText && appState === 'answering'">
+        <div class="answer-loading" v-if="!answerText && !answerError && isAnswering">
+          <span class="stage-label" v-if="appState === 'transcribing'">transcribing audio</span>
+          <span class="stage-label" v-else>thinking</span>
           <span class="blink-cursor accent">|</span>
         </div>
       </div>
@@ -554,6 +648,7 @@ watch(answerText, async () => {
   border-radius: 20px;
   cursor: pointer;
   transition: all 0.2s ease;
+  min-width: 52px;
 }
 
 .rec-pill.inactive {
@@ -608,6 +703,7 @@ watch(answerText, async () => {
   font-size: 11px;
   font-weight: 500;
   text-transform: lowercase;
+  font-variant-numeric: tabular-nums;
 }
 
 .icon-btn {
@@ -636,7 +732,14 @@ watch(answerText, async () => {
   background: rgba(239, 68, 68, 0.12);
 }
 
+.copy-btn {
+  font-size: 14px;
+}
 
+.copy-btn:hover {
+  color: var(--indigo);
+  background: rgba(99, 102, 241, 0.10);
+}
 
 .action-btn {
   -webkit-app-region: no-drag;
@@ -685,60 +788,42 @@ watch(answerText, async () => {
   line-height: 1;
 }
 
-/* ── Row 3: Transcript row ── */
-.transcript-row {
+/* ── API key input ── */
+.key-row {
   display: flex;
   align-items: center;
-  height: 32px;
-  padding: 0 10px;
-  gap: 8px;
+  gap: 6px;
+  padding: 4px 10px 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
 
-.transcript-text {
+.key-input {
   flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  font-size: 11.5px;
-  color: var(--text-secondary);
-  line-height: 32px;
-}
-
-.transcript-placeholder {
-  color: var(--text-hint);
-  font-style: italic;
-}
-
-.blink-cursor {
-  color: var(--text-secondary);
-  animation: blink-cursor 0.8s step-end infinite;
-  margin-left: 1px;
-}
-
-.blink-cursor.accent {
-  color: var(--indigo);
-}
-
-.clear-btn {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 4px 8px;
+  outline: none;
+  height: 24px;
   -webkit-app-region: no-drag;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 5px;
-  color: var(--text-hint);
-  font-size: 10px;
-  font-weight: 500;
-  padding: 2px 8px;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  text-transform: lowercase;
-  flex-shrink: 0;
 }
 
-.clear-btn:hover {
-  color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.08);
+.key-input:focus {
+  border-color: rgba(99, 102, 241, 0.45);
+  background: rgba(99, 102, 241, 0.06);
+}
+
+.key-input::placeholder {
+  color: var(--text-hint);
+}
+
+.key-save-btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 10px;
+  flex-shrink: 0;
 }
 
 /* ── Status ── */
@@ -780,7 +865,7 @@ watch(answerText, async () => {
   height: 32px;
   padding: 0 10px;
   border-bottom: 1px solid rgba(99, 102, 241, 0.10);
-  gap: 8px;
+  gap: 6px;
 }
 
 .answer-label {
@@ -802,6 +887,13 @@ watch(answerText, async () => {
   flex-shrink: 0;
 }
 
+.answer-latency {
+  font-size: 10px;
+  color: var(--text-hint);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
 .answer-elapsed {
   font-size: 10px;
   color: var(--text-hint);
@@ -817,6 +909,7 @@ watch(answerText, async () => {
   max-height: 510px;
   overflow-y: auto;
   user-select: text;
+  -webkit-user-select: text;
 }
 
 .detected-question {
@@ -830,32 +923,136 @@ watch(answerText, async () => {
   white-space: nowrap;
 }
 
-.answer-content {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.answer-bullet {
-  display: flex;
-  gap: 8px;
-  font-size: 12px;
-  line-height: 1.6;
+/* ── Markdown answer ── */
+.answer-md {
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 12.5px;
+  line-height: 1.65;
   color: var(--text-primary);
-  align-items: baseline;
 }
 
-.bullet-dot {
-  color: var(--indigo);
-  font-weight: 700;
-  font-size: 16px;
-  line-height: 1;
-  flex-shrink: 0;
-  margin-top: 1px;
+.answer-md :deep(h2) {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin: 10px 0 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-bottom: 3px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
 
+.answer-md :deep(h3) {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin: 8px 0 3px;
+}
+
+.answer-md :deep(p) {
+  margin-bottom: 5px;
+}
+
+.answer-md :deep(ul),
+.answer-md :deep(ol) {
+  padding-left: 1.4em;
+  margin-bottom: 6px;
+}
+
+.answer-md :deep(li) {
+  margin-bottom: 3px;
+  line-height: 1.55;
+}
+
+.answer-md :deep(strong) {
+  color: var(--text-bright);
+  font-weight: 600;
+}
+
+.answer-md :deep(em) {
+  color: var(--text-secondary);
+}
+
+/* Inline code */
+.answer-md :deep(code):not(pre > code) {
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: 'SF Mono', ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+  font-size: 11px;
+  color: rgba(165, 180, 252, 0.9);
+}
+
+/* Code blocks */
+.answer-md :deep(pre) {
+  background: rgba(0, 0, 0, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  overflow-x: auto;
+}
+
+.answer-md :deep(pre code) {
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: 'SF Mono', ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre;
+}
+
+/* highlight.js token colors (Material Palenight-inspired) */
+.answer-md :deep(.hljs-keyword),
+.answer-md :deep(.hljs-built_in) { color: #c792ea; }
+.answer-md :deep(.hljs-string),
+.answer-md :deep(.hljs-attr) { color: #c3e88d; }
+.answer-md :deep(.hljs-number),
+.answer-md :deep(.hljs-literal) { color: #f78c6c; }
+.answer-md :deep(.hljs-comment) { color: rgba(255, 255, 255, 0.3); font-style: italic; }
+.answer-md :deep(.hljs-function),
+.answer-md :deep(.hljs-title) { color: #82aaff; }
+.answer-md :deep(.hljs-variable),
+.answer-md :deep(.hljs-params) { color: #f07178; }
+.answer-md :deep(.hljs-type),
+.answer-md :deep(.hljs-class .hljs-title) { color: #ffcb6b; }
+.answer-md :deep(.hljs-tag),
+.answer-md :deep(.hljs-name) { color: #f07178; }
+.answer-md :deep(.hljs-meta) { color: rgba(255, 255, 255, 0.4); }
+
+/* ── Error state ── */
+.answer-error {
+  padding: 6px 0 2px;
+  font-size: 11px;
+  color: rgba(239, 68, 68, 0.85);
+  line-height: 1.5;
+}
+
+/* ── Loading state ── */
 .answer-loading {
   padding: 4px 0;
-  font-size: 14px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.stage-label {
+  font-size: 11px;
+  color: var(--text-hint);
+  font-style: italic;
+}
+
+.blink-cursor {
+  color: var(--text-secondary);
+  animation: blink-cursor 0.8s step-end infinite;
+  margin-left: 1px;
+}
+
+.blink-cursor.accent {
+  color: var(--indigo);
 }
 </style>
