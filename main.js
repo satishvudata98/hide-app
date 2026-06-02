@@ -357,7 +357,7 @@ function createTextRequestBody(systemPrompt, userText, conversationHistory = [])
   };
 }
 
-function createVisionRequestBody(systemPrompt, userText, imageBase64) {
+function createVisionRequestBody(systemPrompt, userText, imageBase64, imageType = 'png') {
   return {
     model: 'gpt-4o',
     stream: true,
@@ -373,12 +373,12 @@ function createVisionRequestBody(systemPrompt, userText, imageBase64) {
         content: [
           {
             type: 'text',
-            text: buildExpertUserContent(userText || 'This is a screenshot of a technical environment. Please extract the technical question or code visible and provide a solution.', false)
+            text: buildExpertUserContent(userText || 'This is a screenshot of a technical environment. Please extract the technical question or code visible and provide a solution.', true)
           },
           {
             type: 'image_url',
             image_url: {
-              url: `data:image/png;base64,${imageBase64}`,
+              url: `data:image/${imageType};base64,${imageBase64}`,
               detail: 'high'
             }
           }
@@ -536,6 +536,7 @@ async function runOpenAiRequest(sender, payload) {
   const transcribedText = payload?.transcribedText;
   const audioBase64 = payload?.audioBase64;
   const imageBase64 = payload?.imageBase64;
+  const imageType = payload?.imageType || 'png';
   const prompt = payload?.prompt || '';
   const format = payload?.format || 'wav';
   const conversationHistory = Array.isArray(payload?.conversationHistory) ? payload.conversationHistory : [];
@@ -555,7 +556,7 @@ async function runOpenAiRequest(sender, payload) {
 
   let requestBody;
   if (isVisionRequest) {
-    requestBody = createVisionRequestBody(prompt, transcribedText || '', imageBase64);
+    requestBody = createVisionRequestBody(prompt, transcribedText || '', imageBase64, imageType);
   } else if (isTextRequest) {
     requestBody = createTextRequestBody(prompt, transcribedText, conversationHistory);
   } else {
@@ -651,10 +652,11 @@ function registerIpcHandlers() {
 
       const primarySource = sources[0];
       const thumbnail = primarySource.thumbnail;
-      const pngBuffer = thumbnail.toPNG();
-      const base64 = pngBuffer.toString('base64');
+      // JPEG at 85% quality is ~5-10x smaller than PNG — critical for fast API response
+      const jpegBuffer = thumbnail.toJPEG(85);
+      const base64 = jpegBuffer.toString('base64');
 
-      return { imageBase64: base64 };
+      return { imageBase64: base64, imageType: 'jpeg' };
     } catch (error) {
       return { error: error.message || 'Screen capture failed.' };
     }

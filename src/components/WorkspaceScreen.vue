@@ -38,6 +38,8 @@ const copied = ref(false)
 const recordingSeconds = ref(0)
 const answerError = ref('')
 const liveTranscript = ref('')
+const showPastePanel = ref(false)
+const pasteText = ref('')
 
 let requestId = null
 let answerTimer = null
@@ -162,6 +164,7 @@ async function startRecording() {
     return
   }
 
+  showPastePanel.value = false
   transcriptText.value = ''
   liveTranscript.value = ''
   answerText.value = ''
@@ -353,6 +356,8 @@ async function analyzeScreen() {
     return
   }
 
+  showPastePanel.value = false
+
   if (requestId && isAnswering.value) {
     window.overlayApi?.cancelRequest?.(requestId)
     if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
@@ -373,6 +378,7 @@ async function analyzeScreen() {
 
   detectedQuestion.value = 'Screen analysis'
   answerText.value = ''
+  answerError.value = ''
   showAnswer.value = true
   appState.value = 'answering'
   answerStartTime = Date.now()
@@ -391,8 +397,9 @@ async function analyzeScreen() {
     apiKey: apiKey.value,
     transcribedText: transcriptText.value.trim() || '',
     imageBase64: result.imageBase64,
+    imageType: result.imageType || 'jpeg',
     format: 'text',
-    conversationHistory: conversationHistory.value
+    conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value))
   })
 }
 
@@ -422,8 +429,28 @@ function closeAnswer() {
 // ── Clear audio ──
 function clearAudio() {
   audioChunks = []
-  statusMsg.value = 'Audio cleared.'
-  setTimeout(() => { if (statusMsg.value === 'Audio cleared.') statusMsg.value = '' }, 2000)
+  transcriptText.value = ''
+  liveTranscript.value = ''
+  window.overlayApi?.closeRealtimeSession?.()
+  statusMsg.value = 'Cleared.'
+  setTimeout(() => { if (statusMsg.value === 'Cleared.') statusMsg.value = '' }, 2000)
+}
+
+// ── Clear session history ──
+function clearSession() {
+  conversationHistory.value = []
+  statusMsg.value = 'Session cleared.'
+  setTimeout(() => { if (statusMsg.value === 'Session cleared.') statusMsg.value = '' }, 2000)
+}
+
+// ── Submit pasted text ──
+async function submitPasteText() {
+  const text = pasteText.value.trim()
+  if (!text) return
+  transcriptText.value = text
+  showPastePanel.value = false
+  pasteText.value = ''
+  await answerQuestion()
 }
 
 // ── Exit ──
@@ -550,7 +577,7 @@ onUnmounted(() => {
   if (resizeObserver) resizeObserver.disconnect()
 })
 
-watch([answerText, showAnswer, transcriptText, appState, statusMsg, liveTranscript], () => {
+watch([answerText, showAnswer, transcriptText, appState, statusMsg, liveTranscript, showPastePanel, pasteText], () => {
   nextTick(() => syncWindowHeight())
 })
 
@@ -590,6 +617,10 @@ watch(renderedAnswer, async () => {
             <span class="action-icon">◻</span>
             <span>analyze screen</span>
           </button>
+          <button class="action-btn amber" :class="{ active: showPastePanel }" @click="showPastePanel = !showPastePanel" :disabled="isAnswering">
+            <span class="action-icon">✎</span>
+            <span>paste text</span>
+          </button>
         </div>
 
         <!-- Drag area in the middle -->
@@ -597,7 +628,8 @@ watch(renderedAnswer, async () => {
 
         <div class="right-actions">
           <button class="icon-btn" v-if="isRecording" @click="clearAudio" title="Clear recorded audio">↺</button>
-          <div class="rec-pill" :class="isRecording ? 'active' : 'inactive'" @click="isRecording ? stopRecording() : startRecording()">
+          <button class="icon-btn clear-btn" v-if="conversationHistory.length > 0" @click="clearSession" title="Clear session history">⊘</button>
+          <div class="rec-pill" :class="isRecording ? 'active' : 'inactive'" @click="isRecording ? answerQuestion() : startRecording()">
             <span class="rec-dot" :class="{ pulsing: isRecording }"></span>
             <span class="rec-label">{{ isRecording ? recordingSeconds + 's' : 'rec' }}</span>
           </div>
@@ -624,6 +656,27 @@ watch(renderedAnswer, async () => {
           @keydown.enter="saveApiKey"
         />
         <button class="action-btn indigo key-save-btn" @click="saveApiKey">Save</button>
+      </div>
+
+      <!-- Paste text panel -->
+      <div class="paste-row" v-if="showPastePanel">
+        <div class="paste-header">
+          <span class="paste-title">paste text / code</span>
+          <button class="icon-btn" @click="showPastePanel = false" title="Close">✕</button>
+        </div>
+        <textarea
+          class="paste-textarea"
+          v-model="pasteText"
+          placeholder="Paste code or type a question here..."
+          @keydown.ctrl.enter.prevent="submitPasteText"
+          rows="4"
+        ></textarea>
+        <div class="paste-footer">
+          <span class="paste-hint">Ctrl+Enter to submit</span>
+          <button class="action-btn indigo" @click="submitPasteText" :disabled="!pasteText.trim() || isAnswering">
+            <span>analyze</span>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -1157,5 +1210,86 @@ watch(renderedAnswer, async () => {
 
 .blink-cursor.accent {
   color: var(--indigo);
+}
+
+/* ── Amber action button (paste text) ── */
+.action-btn.amber {
+  background: rgba(245, 158, 11, 0.10);
+  color: rgb(251, 191, 36);
+  border: 1px solid rgba(245, 158, 11, 0.18);
+}
+
+.action-btn.amber:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.20);
+}
+
+.action-btn.amber.active {
+  background: rgba(245, 158, 11, 0.22);
+  border-color: rgba(245, 158, 11, 0.40);
+}
+
+/* ── Clear session button ── */
+.clear-btn:hover {
+  color: rgb(251, 191, 36);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+/* ── Paste text panel ── */
+.paste-row {
+  padding: 6px 10px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.paste-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2px;
+}
+
+.paste-title {
+  font-size: 10px;
+  color: var(--text-hint);
+  text-transform: lowercase;
+  font-weight: 500;
+}
+
+.paste-textarea {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-family: 'SF Mono', ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 6px 8px;
+  outline: none;
+  resize: vertical;
+  box-sizing: border-box;
+  -webkit-app-region: no-drag;
+}
+
+.paste-textarea:focus {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.04);
+}
+
+.paste-textarea::placeholder {
+  color: var(--text-hint);
+}
+
+.paste-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.paste-hint {
+  font-size: 10px;
+  color: var(--text-hint);
 }
 </style>
