@@ -152,6 +152,7 @@ function floatToPcm16Base64(float32Array, sourceRate) {
 }
 
 let micStream = null
+let systemStream = null
 let audioContext = null
 let processor = null
 let silenceGain = null
@@ -175,10 +176,31 @@ async function startRecording() {
   recordingSeconds.value = 0
 
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      video: false
-    })
+    // Capture system audio (loopback, works with earphones) and mic in parallel; either alone is enough
+    const [sysResult, micResult] = await Promise.allSettled([
+      navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }),
+      navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false
+      })
+    ])
+
+    if (sysResult.status === 'fulfilled') {
+      systemStream = sysResult.value
+      // Only the loopback audio is needed — drop the screen video track
+      systemStream.getVideoTracks().forEach(t => t.stop())
+      if (!systemStream.getAudioTracks().length) systemStream = null
+    } else {
+      console.warn('[audio] system audio unavailable:', sysResult.reason?.message)
+    }
+    if (micResult.status === 'fulfilled') {
+      micStream = micResult.value
+    } else {
+      console.warn('[audio] mic unavailable:', micResult.reason?.message)
+    }
+    if (!systemStream && !micStream) {
+      throw micResult.reason || sysResult.reason || new Error('No audio source available')
+    }
 
     audioContext = new AudioContext()
     processor = audioContext.createScriptProcessor(4096, 1, 1)
@@ -188,8 +210,10 @@ async function startRecording() {
     processor.connect(silenceGain)
     silenceGain.connect(audioContext.destination)
 
-    const source = audioContext.createMediaStreamSource(micStream)
-    source.connect(processor)
+    // Both sources feed the same processor input, which sums them into one mono mix
+    for (const stream of [systemStream, micStream]) {
+      if (stream) audioContext.createMediaStreamSource(stream).connect(processor)
+    }
 
     // Open realtime WS session — audio queued in main until WS opens
     window.overlayApi?.startRealtimeSession({ apiKey: apiKey.value }).catch((err) => {
@@ -208,7 +232,7 @@ async function startRecording() {
     appState.value = 'recording'
     recordingTimer = setInterval(() => recordingSeconds.value++, 1000)
   } catch (err) {
-    statusMsg.value = 'Mic access failed: ' + err.message
+    statusMsg.value = 'Audio capture failed: ' + err.message
     stopRecording()
   }
 }
@@ -216,6 +240,7 @@ async function startRecording() {
 function stopAudioCapture() {
   if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null }
+  if (systemStream) { systemStream.getTracks().forEach(t => t.stop()); systemStream = null }
   if (processor) { processor.disconnect(); processor = null }
   if (silenceGain) { silenceGain.disconnect(); silenceGain = null }
   if (audioContext) { audioContext.close().catch(() => {}); audioContext = null }
