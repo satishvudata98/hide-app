@@ -30,10 +30,12 @@ const OPACITY_STEP = 0.1;
 const MIN_OPACITY = 0.75;
 const MAX_OPACITY = 1.0;
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+const DEFAULT_ANSWER_MODEL = 'gpt-4o'; // override with "answerModel" in the settings file
 const HEADERS_TIMEOUT_MS = 30_000;
 const STREAM_IDLE_TIMEOUT_MS = 20_000;
 const WHISPER_TIMEOUT_MS = 30_000;
 const REALTIME_STOP_TIMEOUT_MS = 3_000;
+const MAX_SCREENSHOT_SIDE = 2048;
 
 // Global hotkeys. Change here if any of these clash with another app.
 const SHORTCUTS = {
@@ -61,6 +63,7 @@ let realtimeOrder = [];
 let realtimeAwaitingCommit = false; // speech started (or manual commit sent) but not yet committed
 let realtimeVadSeen = false; // server VAD reported speech at least once this session
 let realtimeHasUncommittedAudio = false;
+let realtimeAcceptingEvents = true; // false while waiting for a buffer clear to be confirmed
 let realtimeStopWaiter = null; // (force?) => void, re-checked whenever an item changes
 
 function getSettingsPath() {
@@ -292,30 +295,26 @@ function configureCapturePermissions() {
   );
 }
 
-const EXPERT_SYSTEM_PROMPT = `You are a senior software engineer with 7+ years of experience, currently being interviewed. Respond in first person as the candidate — confident, specific, and natural. Use the candidate's resume and job description to make every answer feel personal and authentic.
+const EXPERT_SYSTEM_PROMPT = `You help a software engineer answer questions in a live technical interview. Write what the candidate should say: first person, natural, easy to say out loud. Match the candidate's real seniority and experience as shown in their resume below.
 
-OUTPUT FORMAT (strict markdown):
+OUTPUT FORMAT (markdown):
 
-## Answer
-3–6 sentences. Lead with a direct answer, then expand — explain your reasoning, mention a real project or decision, include numbers or outcomes where possible. Sound like someone who has lived this, not someone reciting a definition.
+**Say:** 1–2 sentences the candidate can say immediately. Direct answer first.
 
 ## Key Points
-- 4–6 concrete supporting points
-- Each point ties to specific technologies, decisions made, trade-offs weighed, or results achieved
-- For behavioral questions: follow STAR (Situation → Task → Action → Result) across the points
-- Reference the candidate's resume and job requirements directly
+- 3–4 short bullets: supporting detail, trade-offs, or talking points for a follow-up
+- For behavioral questions, cover Situation → Task → Action → Result across the bullets
 
-## Code Example
-Only for coding, algorithm, or system design questions. Clean, working code under 30 lines with brief inline comments on non-obvious parts. Show best practices and awareness of edge cases.
+## Code
+Only for coding, algorithm, or system design questions: clean, working code under 30 lines with brief comments on non-obvious parts. Leave this section out otherwise.
 
 RULES:
-- Omit Code Example for behavioral, culture-fit, or process questions
-- Never give textbook definitions — always ground answers in real context from the resume and JD
-- Use "I" naturally throughout — this is a spoken interview answer
-- Show engineering depth: mention alternatives you considered, why you chose this approach, what you'd do differently at scale
-- For system design questions: cover scale, trade-offs, and failure modes
-- Never mention being an AI or assistant
-- For screen/image analysis: focus only on code and technical questions visible; ignore faces and PII`;
+- Only mention projects, companies, technologies and numbers that appear in the resume. If the resume has nothing relevant, answer from general engineering knowledge without claiming specific experience. Never invent projects or metrics.
+- Keep sentences short and speakable; use "I" naturally.
+- Prefer practical reasoning over textbook definitions: why this approach, what the alternatives are, what changes at scale.
+- For system design: briefly cover scale, trade-offs and failure modes.
+- Never mention being an AI or assistant.
+- For screenshots: focus only on the code or technical question visible; ignore faces and personal data.`;
 
 function getContextDir() {
   if (!app.isPackaged) return __dirname;
@@ -346,93 +345,55 @@ function getContextFiles() {
   return { jd: readContextFile('jd.txt'), resume: readContextFile('resume.txt') };
 }
 
-function buildExpertUserContent(userText, includeContext = true) {
-  let content = '';
-  if (includeContext) {
-    const { jd, resume } = getContextFiles();
-    if (jd) content += `Job Description:\n${jd}\n\n`;
-    if (resume) content += `Candidate Resume:\n${resume}\n\n`;
-  }
-  content += `User Prompt:\n${userText || 'Transcribe and answer the question'}`;
-  return content;
+// System prompt + JD + resume form one stable prefix, so OpenAI's automatic
+// prompt caching can reuse it across questions.
+function buildSystemMessage() {
+  const { jd, resume } = getContextFiles();
+  let content = EXPERT_SYSTEM_PROMPT;
+  if (jd.trim()) content += `
+
+# Job Description
+${jd.trim()}`;
+  if (resume.trim()) content += `
+
+# Candidate Resume
+${resume.trim()}`;
+  return { role: 'system', content };
 }
 
-function createTextRequestBody(systemPrompt, userText, conversationHistory = []) {
+function getAnswerModel() {
+  return readSettings().answerModel || DEFAULT_ANSWER_MODEL;
+}
+
+function createTextRequestBody(question, conversationHistory = []) {
   return {
-    model: 'gpt-4o',
+    model: getAnswerModel(),
     stream: true,
     temperature: 0.4,
+    max_tokens: 700,
     messages: [
-      {
-        role: 'system',
-        content: EXPERT_SYSTEM_PROMPT
-      },
+      buildSystemMessage(),
       ...conversationHistory.slice(-4),
-      {
-        role: 'user',
-        content: buildExpertUserContent(userText)
-      }
+      { role: 'user', content: `Interviewer question:
+${question}` }
     ]
   };
 }
 
-function createVisionRequestBody(systemPrompt, userText, imageBase64, imageType = 'png', conversationHistory = []) {
+function createVisionRequestBody(imageBase64, imageType, conversationHistory = []) {
   return {
-    model: 'gpt-4o',
+    model: getAnswerModel(),
     stream: true,
     temperature: 0.4,
-    max_tokens: 2048,
+    max_tokens: 1200,
     messages: [
-      {
-        role: 'system',
-        content: EXPERT_SYSTEM_PROMPT
-      },
+      buildSystemMessage(),
       ...conversationHistory.slice(-4),
       {
         role: 'user',
         content: [
-          {
-            type: 'text',
-            text: buildExpertUserContent(userText || 'This is a screenshot of a technical environment. Please extract the technical question or code visible and provide a solution.', true)
-          },
-          {
-            type: 'image_url',
-            image_url: {
-              url: `data:image/${imageType};base64,${imageBase64}`,
-              detail: 'high'
-            }
-          }
-        ]
-      }
-    ]
-  };
-}
-
-function createAudioRequestBody(prompt, audioBase64, format) {
-  return {
-    model: 'gpt-4o-audio-preview',
-    stream: true,
-    modalities: ['text'],
-    temperature: 0.2,
-    messages: [
-      {
-        role: 'system',
-        content: EXPERT_SYSTEM_PROMPT
-      },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: buildExpertUserContent(prompt)
-          },
-          {
-            type: 'input_audio',
-            input_audio: {
-              data: audioBase64,
-              format
-            }
-          }
+          { type: 'text', text: 'This is a screenshot of the interview screen. Extract the technical question or code shown and answer it.' },
+          { type: 'image_url', image_url: { url: `data:image/${imageType};base64,${imageBase64}`, detail: 'high' } }
         ]
       }
     ]
@@ -555,35 +516,24 @@ async function readNonStreamCompletion(response) {
 async function runOpenAiRequest(sender, payload) {
   const requestId = payload?.requestId || `req_${Date.now()}`;
   const apiKey = payload?.apiKey?.trim();
-  const transcribedText = payload?.transcribedText;
-  const audioBase64 = payload?.audioBase64;
+  const question = payload?.transcribedText?.trim();
   const imageBase64 = payload?.imageBase64;
-  const imageType = payload?.imageType || 'png';
-  const prompt = payload?.prompt || '';
-  const format = payload?.format || 'wav';
+  const imageType = payload?.imageType || 'jpeg';
   const conversationHistory = Array.isArray(payload?.conversationHistory) ? payload.conversationHistory : [];
 
   if (!apiKey) {
     throw new Error('Enter your OpenAI API key before sending.');
   }
 
-  const isVisionRequest = !!imageBase64;
-  const isTextRequest = format === 'text' && transcribedText;
-
-  if (!isVisionRequest && !isTextRequest && !audioBase64) {
-    throw new Error('No content to send. Start listening first.');
+  if (!imageBase64 && !question) {
+    throw new Error('No question to answer. Record, paste text or analyze the screen first.');
   }
 
   sender.send('openai:started', { requestId });
 
-  let requestBody;
-  if (isVisionRequest) {
-    requestBody = createVisionRequestBody(prompt, transcribedText || '', imageBase64, imageType, conversationHistory);
-  } else if (isTextRequest) {
-    requestBody = createTextRequestBody(prompt, transcribedText, conversationHistory);
-  } else {
-    requestBody = createAudioRequestBody(prompt, audioBase64, format);
-  }
+  const requestBody = imageBase64
+    ? createVisionRequestBody(imageBase64, imageType, conversationHistory)
+    : createTextRequestBody(question, conversationHistory);
 
   const controller = new AbortController();
   activeRequests.set(requestId, controller);
@@ -697,17 +647,22 @@ function registerIpcHandlers() {
   // Screen capture for "analyze screen" feature
   ipcMain.handle('app:capture-screen', async () => {
     try {
+      // Capture the display the cursor is on, at native aspect ratio, long side ≤ 2048px
+      const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+      const nativeWidth = display.size.width * display.scaleFactor;
+      const nativeHeight = display.size.height * display.scaleFactor;
+      const scale = Math.min(1, MAX_SCREENSHOT_SIDE / Math.max(nativeWidth, nativeHeight));
       const sources = await desktopCapturer.getSources({
         types: ['screen'],
-        thumbnailSize: { width: 1920, height: 1080 }
+        thumbnailSize: { width: Math.round(nativeWidth * scale), height: Math.round(nativeHeight * scale) }
       });
 
       if (!sources || sources.length === 0) {
         return { error: 'No screen sources found.' };
       }
 
-      const primarySource = sources[0];
-      const thumbnail = primarySource.thumbnail;
+      const source = sources.find((s) => s.display_id === String(display.id)) || sources[0];
+      const thumbnail = source.thumbnail;
       // JPEG at 85% quality is ~5-10x smaller than PNG — critical for fast API response
       const jpegBuffer = thumbnail.toJPEG(85);
       const base64 = jpegBuffer.toString('base64');
@@ -722,21 +677,22 @@ function registerIpcHandlers() {
   ipcMain.on('app:resize-height', (_event, height) => {
     if (!overlayWindow || overlayWindow.isDestroyed()) return;
     const bounds = overlayWindow.getBounds();
-    overlayWindow.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width, height: Math.max(80, Math.round(height)) });
+    const { workArea } = screen.getDisplayMatching(bounds);
+    const maxHeight = workArea.y + workArea.height - bounds.y;
+    const clamped = Math.min(maxHeight, Math.max(80, Math.round(height)));
+    if (clamped !== bounds.height) overlayWindow.setBounds({ ...bounds, height: clamped });
   });
 
-  // Whisper transcription for live audio chunks
+  // Whisper transcription, used when the realtime session produced no transcript
   ipcMain.handle('whisper:transcribe', async (_event, payload) => {
     const apiKey = payload?.apiKey?.trim();
-    const audioBase64 = payload?.audioBase64;
 
-    if (!apiKey || !audioBase64) {
+    if (!apiKey || !payload?.wav) {
       return { text: '', error: 'Missing API key or audio data.' };
     }
 
     try {
-      // Convert base64 to Buffer
-      const audioBuffer = Buffer.from(audioBase64, 'base64');
+      const audioBuffer = Buffer.from(payload.wav);
 
       // Build multipart form data manually
       const boundary = '----WhisperBoundary' + Date.now();
@@ -785,13 +741,24 @@ function registerIpcHandlers() {
   });
 
   // ── Realtime transcription via OpenAI Realtime API (WebSocket) ──
+  // The socket stays open between recordings. Starting again on an open socket
+  // just clears the server-side buffer; events are ignored until the server
+  // confirms the clear, so leftovers from the previous recording can't leak in.
   ipcMain.handle('realtime:start', (_event, { apiKey }) => {
-    if (realtimeWs) {
-      try { realtimeWs.close(); } catch {}
-      realtimeWs = null;
-    }
     resetRealtimeTranscript();
+
+    if (realtimeWs?.readyState === WebSocket.OPEN) {
+      realtimeAcceptingEvents = false;
+      realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
+      console.log('[realtime] reusing open session');
+      return { ok: true };
+    }
+    if (realtimeWs?.readyState === WebSocket.CONNECTING) {
+      return { ok: true };
+    }
+
     realtimeAudioQueue = [];
+    realtimeAcceptingEvents = true;
     console.log('[realtime] starting session...');
 
     return new Promise((resolve, reject) => {
@@ -854,8 +821,9 @@ function registerIpcHandlers() {
     });
   });
 
-  ipcMain.on('realtime:audio-chunk', (_event, { audioBase64 }) => {
+  ipcMain.on('realtime:audio-chunk', (_event, pcm) => {
     if (!realtimeWs) return;
+    const audioBase64 = Buffer.from(pcm).toString('base64');
     realtimeHasUncommittedAudio = true;
     if (realtimeWs.readyState === WebSocket.OPEN) {
       realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: audioBase64 }));
@@ -897,16 +865,6 @@ function registerIpcHandlers() {
       if (force || !hasPendingRealtimeItems()) finish();
     };
   }));
-
-  ipcMain.on('realtime:close', () => {
-    realtimeStopWaiter = null;
-    if (realtimeWs) {
-      try { realtimeWs.close(); } catch {}
-      realtimeWs = null;
-    }
-    resetRealtimeTranscript();
-    realtimeAudioQueue = [];
-  });
 }
 
 function resetRealtimeTranscript() {
@@ -937,6 +895,11 @@ function hasPendingRealtimeItems() {
 }
 
 function handleRealtimeEvent(event) {
+  if (!realtimeAcceptingEvents) {
+    if (event.type === 'input_audio_buffer.cleared') realtimeAcceptingEvents = true;
+    return;
+  }
+
   switch (event.type) {
     case 'input_audio_buffer.speech_started':
       realtimeVadSeen = true;
@@ -949,23 +912,30 @@ function handleRealtimeEvent(event) {
       getRealtimeItem(event.item_id);
       break;
 
-    case 'conversation.item.input_audio_transcription.delta':
-      getRealtimeItem(event.item_id).text += event.delta || '';
+    case 'conversation.item.input_audio_transcription.delta': {
+      const item = realtimeItems.get(event.item_id);
+      if (!item) return;
+      item.text += event.delta || '';
       emitToRenderer('realtime:transcript-delta', { displayText: getRealtimeTranscript() });
       break;
+    }
 
     case 'conversation.item.input_audio_transcription.completed': {
-      const item = getRealtimeItem(event.item_id);
+      const item = realtimeItems.get(event.item_id);
+      if (!item) return;
       item.text = event.transcript || '';
       item.done = true;
       emitToRenderer('realtime:transcript-done', { transcript: getRealtimeTranscript() });
       break;
     }
 
-    case 'conversation.item.input_audio_transcription.failed':
-      getRealtimeItem(event.item_id).done = true;
+    case 'conversation.item.input_audio_transcription.failed': {
+      const item = realtimeItems.get(event.item_id);
+      if (!item) return;
+      item.done = true;
       console.warn('[realtime] transcription failed:', JSON.stringify(event.error));
       break;
+    }
 
     case 'error':
       // A commit on an empty buffer is expected when VAD already committed it.
@@ -1087,4 +1057,5 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  if (realtimeWs) realtimeWs.close();
 });

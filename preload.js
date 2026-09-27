@@ -31,9 +31,8 @@ contextBridge.exposeInMainWorld('overlayApi', {
   onShortcutAnswer: (callback) => subscribe('shortcut:answer', callback),
   onShortcutScreen: (callback) => subscribe('shortcut:screen', callback),
   startRealtimeSession: (payload) => ipcRenderer.invoke('realtime:start', payload),
-  sendRealtimeAudioChunk: (payload) => ipcRenderer.send('realtime:audio-chunk', payload),
+  sendRealtimeAudioChunk: (pcm) => ipcRenderer.send('realtime:audio-chunk', pcm),
   stopRealtimeSession: () => ipcRenderer.invoke('realtime:stop'),
-  closeRealtimeSession: () => ipcRenderer.send('realtime:close'),
   onRealtimeTranscriptDelta: (cb) => subscribe('realtime:transcript-delta', cb),
   onRealtimeTranscriptDone: (cb) => subscribe('realtime:transcript-done', cb),
   onRealtimeError: (cb) => subscribe('realtime:error', cb)

@@ -9,6 +9,7 @@ import typescript from 'highlight.js/lib/languages/typescript'
 import bash from 'highlight.js/lib/languages/bash'
 import sql from 'highlight.js/lib/languages/sql'
 import DOMPurify from 'dompurify'
+import pcmWorkletUrl from '../audio/pcm-worklet.js?url&no-inline'
 
 // ── Config ──
 const envApiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_OPENAI_apiKey || ''
@@ -43,6 +44,7 @@ const pasteText = ref('')
 
 const SCREEN_HISTORY_QUESTION = '[Screenshot: question shown on screen]'
 const MAX_FALLBACK_AUDIO_SECONDS = 120
+const PCM_SAMPLE_RATE = 24000 // realtime API input rate; also used for the Whisper fallback WAV
 
 let requestId = null
 let historyQuestion = '' // what gets stored as the user turn once the answer completes
@@ -50,6 +52,9 @@ let answerTimer = null
 let answerStartTime = 0
 let resizeObserver = null
 let recordingTimer = null
+let pendingAnswerText = null
+let answerRenderFrame = null
+let stickToBottom = true // auto-scroll only while the reader is at the bottom
 
 // ── Computed ──
 const isRecording = computed(() => appState.value === 'recording')
@@ -68,100 +73,34 @@ const renderedAnswer = computed(() => {
 })
 
 // ── Audio Helpers ──
-function mixToMono(inputBuffer) {
-  const ch = inputBuffer.numberOfChannels
-  const len = inputBuffer.length
-  const mono = new Float32Array(len)
-  for (let i = 0; i < len; i++) {
-    let s = 0
-    for (let c = 0; c < ch; c++) s += inputBuffer.getChannelData(c)[i] || 0
-    mono[i] = s / Math.max(ch, 1)
-  }
-  return mono
-}
-
-function mergeChunks(chunks) {
+function mergePcmFrames(frames) {
   let total = 0
-  for (const c of chunks) total += c.length
-  const merged = new Float32Array(total)
-  let off = 0
-  for (const c of chunks) { merged.set(c, off); off += c.length }
+  for (const frame of frames) total += frame.length
+  const merged = new Int16Array(total)
+  let offset = 0
+  for (const frame of frames) { merged.set(frame, offset); offset += frame.length }
   return merged
 }
 
-function downsample(buffer, fromRate, toRate) {
-  if (toRate >= fromRate) return buffer
-  const ratio = fromRate / toRate
-  const newLen = Math.round(buffer.length / ratio)
-  const result = new Float32Array(newLen)
-  for (let i = 0; i < newLen; i++) {
-    const start = Math.round(i * ratio)
-    const end = Math.round((i + 1) * ratio)
-    let sum = 0, count = 0
-    for (let j = start; j < end && j < buffer.length; j++) { sum += buffer[j]; count++ }
-    result[i] = count ? sum / count : 0
-  }
-  return result
-}
-
-function encodeWav(samples, sampleRate) {
-  const buf = new ArrayBuffer(44 + samples.length * 2)
+function encodeWav(pcm16, sampleRate) {
+  const buf = new ArrayBuffer(44 + pcm16.byteLength)
   const v = new DataView(buf)
   const ws = (view, o, str) => { for (let i = 0; i < str.length; i++) view.setUint8(o + i, str.charCodeAt(i)) }
-  ws(v, 0, 'RIFF'); v.setUint32(4, 36 + samples.length * 2, true)
+  ws(v, 0, 'RIFF'); v.setUint32(4, 36 + pcm16.byteLength, true)
   ws(v, 8, 'WAVE'); ws(v, 12, 'fmt ')
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true)
   v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true)
   v.setUint16(32, 2, true); v.setUint16(34, 16, true)
-  ws(v, 36, 'data'); v.setUint32(40, samples.length * 2, true)
-  let offset = 44
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]))
-    v.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
-    offset += 2
-  }
+  ws(v, 36, 'data'); v.setUint32(40, pcm16.byteLength, true)
+  new Int16Array(buf, 44).set(pcm16)
   return buf
-}
-
-function arrayBufferToBase64(buffer) {
-  return new Promise((resolve, reject) => {
-    const blob = new Blob([buffer], { type: 'audio/wav' })
-    const reader = new FileReader()
-    reader.onloadend = () => {
-      const b64 = reader.result.split(',')[1]
-      if (!b64) { reject(new Error('Base64 conversion failed')); return }
-      resolve(b64)
-    }
-    reader.onerror = () => reject(new Error('File read error'))
-    reader.readAsDataURL(blob)
-  })
-}
-
-// Downsample Float32 mono → PCM16 at 24kHz → base64 (sync, for realtime streaming)
-function floatToPcm16Base64(float32Array, sourceRate) {
-  const ratio = sourceRate / 24000
-  const targetLen = Math.floor(float32Array.length / ratio)
-  const pcm16 = new Int16Array(targetLen)
-  for (let i = 0; i < targetLen; i++) {
-    const start = Math.floor(i * ratio)
-    const end = Math.floor((i + 1) * ratio)
-    let sum = 0, count = 0
-    for (let j = start; j < end && j < float32Array.length; j++) { sum += float32Array[j]; count++ }
-    const s = count ? sum / count : 0
-    pcm16[i] = Math.max(-32768, Math.min(32767, s < 0 ? s * 32768 : s * 32767))
-  }
-  const bytes = new Uint8Array(pcm16.buffer)
-  let binary = ''
-  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCodePoint(bytes[i])
-  return btoa(binary)
 }
 
 let micStream = null
 let systemStream = null
 let audioContext = null
-let processor = null
-let silenceGain = null
-let audioChunks = []
+let workletNode = null
+let pcmFrames = [] // Int16Array frames at PCM_SAMPLE_RATE, kept for the Whisper fallback
 
 async function startRecording() {
   if (appState.value !== 'idle') return
@@ -177,7 +116,7 @@ async function startRecording() {
   detectedQuestion.value = ''
   showAnswer.value = false
   statusMsg.value = ''
-  audioChunks = []
+  pcmFrames = []
   recordingSeconds.value = 0
 
   try {
@@ -207,34 +146,28 @@ async function startRecording() {
       throw micResult.reason || sysResult.reason || new Error('No audio source available')
     }
 
-    audioContext = new AudioContext()
-    processor = audioContext.createScriptProcessor(4096, 1, 1)
+    // The context runs at the realtime API's rate; Chromium resamples the inputs
+    audioContext = new AudioContext({ sampleRate: PCM_SAMPLE_RATE })
+    await audioContext.audioWorklet.addModule(pcmWorkletUrl)
+    workletNode = new AudioWorkletNode(audioContext, 'pcm-capture', { numberOfOutputs: 0 })
 
-    silenceGain = audioContext.createGain()
-    silenceGain.gain.value = 0
-    processor.connect(silenceGain)
-    silenceGain.connect(audioContext.destination)
-
-    // Both sources feed the same processor input, which sums them into one mono mix
+    // Both sources feed the same worklet input, which mixes them into one mono stream
     for (const stream of [systemStream, micStream]) {
-      if (stream) audioContext.createMediaStreamSource(stream).connect(processor)
+      if (stream) audioContext.createMediaStreamSource(stream).connect(workletNode)
     }
 
-    // Open realtime WS session — audio queued in main until WS opens
-    window.overlayApi?.startRealtimeSession({ apiKey: apiKey.value }).catch((err) => {
+    // Audio is queued in main until the socket is open (or sent straight away if it is reused)
+    window.overlayApi.startRealtimeSession({ apiKey: apiKey.value }).catch((err) => {
       console.warn('[realtime] session start failed, will fall back to Whisper:', err.message)
     })
 
-    const captureRate = audioContext.sampleRate
-    const maxFallbackChunks = Math.ceil((MAX_FALLBACK_AUDIO_SECONDS * captureRate) / 4096)
+    const maxFallbackFrames = MAX_FALLBACK_AUDIO_SECONDS * 10 // worklet frames are 100ms
 
-    processor.onaudioprocess = (e) => {
+    workletNode.port.onmessage = ({ data }) => {
       if (appState.value !== 'recording') return
-      const mono = mixToMono(e.inputBuffer)
-      // Retained for the Whisper fallback; only the most recent ~2 minutes are kept
-      audioChunks.push(mono)
-      if (audioChunks.length > maxFallbackChunks) audioChunks.shift()
-      window.overlayApi?.sendRealtimeAudioChunk({ audioBase64: floatToPcm16Base64(mono, captureRate) })
+      pcmFrames.push(new Int16Array(data.pcm))
+      if (pcmFrames.length > maxFallbackFrames) pcmFrames.shift()
+      window.overlayApi.sendRealtimeAudioChunk(data.pcm)
     }
 
     appState.value = 'recording'
@@ -249,8 +182,7 @@ function stopAudioCapture() {
   if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null }
   if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null }
   if (systemStream) { systemStream.getTracks().forEach(t => t.stop()); systemStream = null }
-  if (processor) { processor.disconnect(); processor = null }
-  if (silenceGain) { silenceGain.disconnect(); silenceGain = null }
+  if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null }
   if (audioContext) { audioContext.close().catch(() => {}); audioContext = null }
 }
 
@@ -258,12 +190,25 @@ function stopRecording() {
   stopAudioCapture()
   if (appState.value === 'recording') appState.value = 'idle'
   liveTranscript.value = ''
-  window.overlayApi?.closeRealtimeSession()
 }
 
 // ── Answer lifecycle helpers ──
 function clearAnswerTimer() {
   if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+}
+
+// Streaming deltas re-render the whole markdown, so apply at most one per frame
+function scheduleAnswerText(text) {
+  pendingAnswerText = text
+  if (answerRenderFrame) return
+  answerRenderFrame = requestAnimationFrame(() => {
+    answerRenderFrame = null
+    answerText.value = pendingAnswerText
+  })
+}
+
+function cancelAnswerRender() {
+  if (answerRenderFrame) { cancelAnimationFrame(answerRenderFrame); answerRenderFrame = null }
 }
 
 function beginAnswerPanel(question) {
@@ -274,6 +219,8 @@ function beginAnswerPanel(question) {
   answerStartTime = Date.now()
   answerElapsed.value = 0
   responseLatency.value = null
+  stickToBottom = true
+  cancelAnswerRender()
   clearAnswerTimer()
   answerTimer = setInterval(() => {
     answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
@@ -288,16 +235,14 @@ function sendAnswerRequest(payload, questionForHistory) {
   window.overlayApi.runOpenAiRequest({
     requestId,
     apiKey: apiKey.value,
-    format: 'text',
     conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value)),
     ...payload
   })
 }
 
-// Stops the realtime session and returns the final transcript, or a WAV
-// (base64) of the retained audio when realtime produced nothing.
+// Stops capture and returns the final realtime transcript, or a WAV of the
+// retained audio when realtime produced nothing.
 async function finalizeRecording() {
-  const capturedSampleRate = audioContext?.sampleRate || 48000
   stopAudioCapture()
   liveTranscript.value = ''
   appState.value = 'finalizing'
@@ -310,19 +255,15 @@ async function finalizeRecording() {
   } catch (err) {
     console.warn('[realtime] transcript unavailable, falling back to Whisper:', err.message)
   }
-  window.overlayApi.closeRealtimeSession()
 
-  if (transcript || !audioChunks.length) return { transcript, audioBase64: null }
-
-  statusMsg.value = 'Processing audio...'
-  const downsampled = downsample(mergeChunks(audioChunks), capturedSampleRate, 16000)
-  return { transcript: '', audioBase64: await arrayBufferToBase64(encodeWav(downsampled, 16000)) }
+  if (transcript || !pcmFrames.length) return { transcript, wav: null }
+  return { transcript: '', wav: encodeWav(mergePcmFrames(pcmFrames), PCM_SAMPLE_RATE) }
 }
 
-async function transcribeWithWhisper(audioBase64) {
+async function transcribeWithWhisper(wav) {
   appState.value = 'transcribing'
   statusMsg.value = 'Transcribing...'
-  const result = await window.overlayApi.transcribeAudio({ apiKey: apiKey.value, audioBase64, format: 'wav' })
+  const result = await window.overlayApi.transcribeAudio({ apiKey: apiKey.value, wav })
   const text = result.text?.trim() || ''
   if (result.error) statusMsg.value = 'Transcription failed: ' + result.error
   else if (!text) statusMsg.value = 'No speech detected. Try again.'
@@ -337,16 +278,16 @@ async function answerQuestion() {
     return
   }
 
-  let audioBase64 = null
+  let wav = null
   if (appState.value === 'recording') {
     const finalized = await finalizeRecording()
     if (finalized.transcript) transcriptText.value = finalized.transcript
-    audioBase64 = finalized.audioBase64
+    wav = finalized.wav
     appState.value = 'idle'
   }
 
   let question = transcriptText.value.trim()
-  if (!question && !audioBase64) {
+  if (!question && !wav) {
     statusMsg.value = 'No transcript or audio to analyze.'
     return
   }
@@ -354,7 +295,7 @@ async function answerQuestion() {
   beginAnswerPanel(question)
 
   if (!question) {
-    question = await transcribeWithWhisper(audioBase64)
+    question = await transcribeWithWhisper(wav)
     if (appState.value !== 'transcribing') return // stopped or closed meanwhile
     if (!question) {
       clearAnswerTimer()
@@ -398,6 +339,7 @@ async function analyzeScreen() {
 function stopAnswer() {
   if (requestId) window.overlayApi?.cancelRequest?.(requestId)
   requestId = null
+  cancelAnswerRender()
   clearAnswerTimer()
   if (isAnswering.value) appState.value = 'idle'
   statusMsg.value = ''
@@ -429,10 +371,10 @@ function closeAnswer() {
 
 // ── Clear audio ──
 function clearAudio() {
-  audioChunks = []
+  pcmFrames = []
   transcriptText.value = ''
   liveTranscript.value = ''
-  window.overlayApi?.closeRealtimeSession?.()
+  window.overlayApi.startRealtimeSession({ apiKey: apiKey.value }).catch(() => {})
   statusMsg.value = 'Cleared.'
   setTimeout(() => { if (statusMsg.value === 'Cleared.') statusMsg.value = '' }, 2000)
 }
@@ -505,13 +447,14 @@ onMounted(() => {
 
   window.overlayApi.onOpenAiDelta((p) => {
     if (p.requestId !== requestId) return
-    answerText.value = p.text || ''
+    scheduleAnswerText(p.text || '')
     if (statusMsg.value === 'Thinking...') statusMsg.value = ''
   })
 
   window.overlayApi.onOpenAiDone((p) => {
     if (p.requestId !== requestId) return
-    const finalText = p.text || answerText.value
+    cancelAnswerRender()
+    const finalText = p.text || pendingAnswerText || answerText.value
     answerText.value = finalText
     responseLatency.value = ((Date.now() - answerStartTime) / 1000).toFixed(1) + 's'
     clearAnswerTimer()
@@ -580,12 +523,9 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopRecording()
+  cancelAnswerRender()
   if (answerTimer) clearInterval(answerTimer)
   if (resizeObserver) resizeObserver.disconnect()
-})
-
-watch([answerText, showAnswer, transcriptText, appState, statusMsg, liveTranscript, showPastePanel, pasteText], () => {
-  nextTick(() => syncWindowHeight())
 })
 
 const answerBodyEl = ref(null)
@@ -603,9 +543,14 @@ watch(renderedAnswer, async () => {
     answerBodyEl.value.querySelectorAll('pre code:not(.hljs)').forEach(el => {
       hljs.highlightElement(el)
     })
-    answerBodyEl.value.scrollTop = answerBodyEl.value.scrollHeight
+    if (stickToBottom) answerBodyEl.value.scrollTop = answerBodyEl.value.scrollHeight
   }
 })
+
+function onAnswerScroll() {
+  const el = answerBodyEl.value
+  if (el) stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+}
 </script>
 
 <template>
@@ -706,7 +651,7 @@ watch(renderedAnswer, async () => {
         <button class="icon-btn close-btn" @click="closeAnswer" title="Close">✕</button>
       </div>
 
-      <div class="answer-body" ref="answerBodyEl">
+      <div class="answer-body" ref="answerBodyEl" @scroll="onAnswerScroll">
         <!-- Detected question -->
         <div class="detected-question" v-if="detectedQuestion">
           "{{ detectedQuestion }}"
@@ -735,6 +680,8 @@ watch(renderedAnswer, async () => {
    OVERLAY ROOT
    ═══════════════════════════════════════════ */
 .overlay-root {
+  /* Never shrink to the window height: the window is sized from this element */
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   align-items: stretch;
