@@ -24,38 +24,43 @@ RULES:
 - For screenshots: focus only on the code or technical question visible; ignore faces and personal data.`;
 
 const SCREENSHOT_INSTRUCTION = 'This is a screenshot of the interview screen. Extract the technical question or code shown and answer it.';
+const DETAILED_STYLE = 'Answer style: detailed. Key Points may have up to 6 bullets with more explanation.';
+const MAX_TOKENS = { brief: 700, detailed: 1100 };
 
 // Prompt + JD + resume form one stable prefix, so OpenAI's automatic prompt
 // caching can reuse it across questions.
-function buildSystemMessage({ jd, resume }) {
+function buildSystemMessage({ jd, resume }, style = 'brief') {
   let content = SYSTEM_PROMPT;
+  if (style === 'detailed') content += `\n${DETAILED_STYLE}`;
   if (jd) content += `\n\n# Job Description\n${jd}`;
   if (resume) content += `\n\n# Candidate Resume\n${resume}`;
   return { role: 'system', content };
 }
 
-function createTextRequestBody({ model, context, history = [], question }) {
+// A follow-up is an instruction about the previous answer ("make it shorter"),
+// not a new interviewer question.
+function createTextRequestBody({ model, context, style = 'brief', history = [], question, isFollowUp = false }) {
   return {
     model,
     stream: true,
     temperature: 0.4,
-    max_tokens: 700,
+    max_tokens: MAX_TOKENS[style] || MAX_TOKENS.brief,
     messages: [
-      buildSystemMessage(context),
+      buildSystemMessage(context, style),
       ...history.slice(-HISTORY_MESSAGES),
-      { role: 'user', content: `Interviewer question:\n${question}` }
+      { role: 'user', content: isFollowUp ? question : `Interviewer question:\n${question}` }
     ]
   };
 }
 
-function createVisionRequestBody({ model, context, history = [], imageBase64, imageType = 'jpeg' }) {
+function createVisionRequestBody({ model, context, style = 'brief', history = [], imageBase64, imageType = 'jpeg' }) {
   return {
     model,
     stream: true,
     temperature: 0.4,
     max_tokens: 1200,
     messages: [
-      buildSystemMessage(context),
+      buildSystemMessage(context, style),
       ...history.slice(-HISTORY_MESSAGES),
       {
         role: 'user',

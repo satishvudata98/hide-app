@@ -1,6 +1,7 @@
 'use strict';
 
 const { splitSseEvents, parseChatDelta } = require('./sse');
+const { describeHttpError, describeNetworkError } = require('./errors');
 
 const API_BASE = 'https://api.openai.com/v1';
 const HEADERS_TIMEOUT_MS = 30_000;
@@ -80,7 +81,9 @@ async function streamChatCompletion({ apiKey, body, controller, onDelta }) {
     }, () => armTimer(HEADERS_TIMEOUT_MS, 'headers'));
 
     if (!response.ok) {
-      throw new Error(`OpenAI request failed (${response.status}): ${await response.text()}`);
+      const body = await response.text();
+      console.error(`[openai] ${response.status}: ${body}`);
+      throw new Error(describeHttpError(response.status, body));
     }
 
     const rearmIdle = () => armTimer(STREAM_IDLE_TIMEOUT_MS, 'idle');
@@ -93,6 +96,7 @@ async function streamChatCompletion({ apiKey, body, controller, onDelta }) {
     if (error.name === 'AbortError' && timeoutReason === 'idle') {
       throw new Error(`Answer stream stalled for ${STREAM_IDLE_TIMEOUT_MS / 1000}s and was stopped. Try again.`);
     }
+    if (error.name === 'TypeError') throw new Error(describeNetworkError(error));
     throw error;
   } finally {
     clearTimeout(timer);
@@ -114,7 +118,9 @@ async function transcribeWithWhisper({ apiKey, wav }) {
     });
 
     if (!response.ok) {
-      return { text: '', error: `Whisper failed (${response.status}): ${await response.text()}` };
+      const body = await response.text();
+      console.error(`[whisper] ${response.status}: ${body}`);
+      return { text: '', error: describeHttpError(response.status, body) };
     }
     const result = await response.json();
     return { text: result.text || '' };
@@ -122,7 +128,7 @@ async function transcribeWithWhisper({ apiKey, wav }) {
     if (error.name === 'TimeoutError') {
       return { text: '', error: `Whisper did not respond within ${WHISPER_TIMEOUT_MS / 1000}s.` };
     }
-    return { text: '', error: error.message || 'Whisper transcription error.' };
+    return { text: '', error: describeNetworkError(error) || 'Whisper transcription error.' };
   }
 }
 

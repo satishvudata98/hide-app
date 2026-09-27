@@ -6,12 +6,20 @@ export const PCM_SAMPLE_RATE = 24000 // realtime API input rate; also used for t
 const MAX_FALLBACK_FRAMES = 120 * 10 // ~2 minutes of 100ms worklet frames
 
 // System audio (loopback, works with earphones) and the mic, opened in
-// parallel. Either one alone is enough.
-async function openAudioStreams() {
+// parallel. Either one alone is enough. An unavailable saved mic falls back
+// to the default one (deviceId is a preference, not a requirement).
+async function openAudioStreams({ micDeviceId = '', systemAudio = true }) {
   const [system, mic] = await Promise.allSettled([
-    navigator.mediaDevices.getDisplayMedia({ video: true, audio: true }),
+    systemAudio
+      ? navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+      : Promise.reject(new Error('system audio turned off in settings')),
     navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: {
+        deviceId: micDeviceId || undefined,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
       video: false
     })
   ])
@@ -33,19 +41,22 @@ async function openAudioStreams() {
 
 // Captures audio as mono 24kHz PCM16 frames of 100ms. Each frame is passed to
 // onFrame(ArrayBuffer); the last ~2 minutes are kept for a Whisper fallback.
+// `level` (0..1) follows the input loudness so a silent mic is obvious.
 export function useRecorder() {
   const seconds = ref(0)
+  const level = ref(0)
   let streams = []
   let audioContext = null
   let workletNode = null
   let timer = null
   let frames = []
 
-  async function start(onFrame) {
+  async function start(onFrame, options = {}) {
     frames = []
     seconds.value = 0
+    level.value = 0
     try {
-      streams = await openAudioStreams()
+      streams = await openAudioStreams(options)
       // The context runs at the target rate; Chromium resamples the inputs
       audioContext = new AudioContext({ sampleRate: PCM_SAMPLE_RATE })
       await audioContext.audioWorklet.addModule(pcmWorkletUrl)
@@ -56,6 +67,8 @@ export function useRecorder() {
       workletNode.port.onmessage = ({ data }) => {
         frames.push(new Int16Array(data.pcm))
         if (frames.length > MAX_FALLBACK_FRAMES) frames.shift()
+        // Speech RMS is roughly 0.02–0.3; sqrt spreads that across the meter. Fall back slowly.
+        level.value = Math.max(Math.min(1, Math.sqrt(data.level) * 1.6), level.value * 0.6)
         onFrame(data.pcm)
       }
       timer = setInterval(() => seconds.value++, 1000)
@@ -68,6 +81,7 @@ export function useRecorder() {
   function stop() {
     clearInterval(timer)
     timer = null
+    level.value = 0
     streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()))
     streams = []
     if (workletNode) {
@@ -87,5 +101,5 @@ export function useRecorder() {
     return frames.length ? encodeWav(mergePcmFrames(frames), PCM_SAMPLE_RATE) : null
   }
 
-  return { seconds, start, stop, clearBuffer, takeFallbackWav }
+  return { seconds, level, start, stop, clearBuffer, takeFallbackWav }
 }

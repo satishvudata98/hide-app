@@ -1,13 +1,19 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import MainBar from './MainBar.vue'
 import PastePanel from './PastePanel.vue'
 import AnswerPanel from './AnswerPanel.vue'
+import SettingsPanel from './SettingsPanel.vue'
 import { useRecorder } from '../composables/useRecorder'
 import { useAnswer } from '../composables/useAnswer'
 
 const api = window.overlayApi
 const SCREEN_HISTORY_QUESTION = '[Screenshot: question shown on screen]'
+const FOLLOW_UP_INSTRUCTIONS = {
+  shorter: 'Make that answer shorter: one or two sentences I can say right away.',
+  'with code': 'Add a short, working code example to that answer.',
+  simpler: 'Explain that answer more simply, in plain words.'
+}
 
 // ── API key ──
 const envApiKey = import.meta.env.VITE_OPENAI_API_KEY || import.meta.env.VITE_OPENAI_apiKey || ''
@@ -22,6 +28,11 @@ const transcriptText = ref('') // the question to answer (realtime transcript or
 const liveTranscript = ref('')
 const statusMsg = ref('')
 const showPastePanel = ref(false)
+const showSettings = ref(false)
+const clickThrough = ref(false)
+
+// Persisted in the settings file; answerModel/answerStyle are read by main per request
+const settings = reactive({ micDeviceId: '', systemAudio: true, answerModel: '', answerStyle: 'brief' })
 
 const recorder = useRecorder()
 const answer = useAnswer()
@@ -29,6 +40,9 @@ const answer = useAnswer()
 const isRecording = computed(() => phase.value === 'recording')
 const isBusy = computed(() => ['finalizing', 'transcribing', 'capturing'].includes(phase.value) || answer.streaming.value)
 const canAnswer = computed(() => !isBusy.value && (isRecording.value || !!transcriptText.value.trim()))
+const canFollowUp = computed(() =>
+  !isBusy.value && !isRecording.value && !!answer.latency.value && !!answer.text.value && answer.history.value.length > 0
+)
 const loadingLabel = computed(() => {
   if (phase.value === 'transcribing') return 'transcribing audio'
   return answer.streaming.value ? 'thinking' : ''
@@ -63,7 +77,10 @@ async function startRecording() {
   })
 
   try {
-    await recorder.start((pcm) => api.sendRealtimeAudioChunk(pcm))
+    await recorder.start((pcm) => api.sendRealtimeAudioChunk(pcm), {
+      micDeviceId: settings.micDeviceId,
+      systemAudio: settings.systemAudio
+    })
     phase.value = 'recording'
   } catch (err) {
     statusMsg.value = 'Audio capture failed: ' + err.message
@@ -158,6 +175,13 @@ async function analyzeScreen() {
   answer.send(apiKey.value, { imageBase64: result.imageBase64, imageType: result.imageType }, SCREEN_HISTORY_QUESTION)
 }
 
+function followUp(kind) {
+  if (!canFollowUp.value || !requireApiKey()) return
+  const instruction = FOLLOW_UP_INSTRUCTIONS[kind]
+  answer.begin(`↳ ${kind}`)
+  answer.send(apiKey.value, { question: instruction, isFollowUp: true }, instruction)
+}
+
 function stopAnswer() {
   answer.stop()
   if (phase.value === 'transcribing') phase.value = 'idle'
@@ -174,9 +198,31 @@ function submitPasteText(text) {
   answerQuestion()
 }
 
+// Paste and settings share the space under the bar; only one is open at a time
+function togglePanel(name) {
+  const panel = name === 'paste' ? showPastePanel : showSettings
+  const opening = !panel.value
+  showPastePanel.value = false
+  showSettings.value = false
+  panel.value = opening
+}
+
 function clearSession() {
   answer.clearHistory()
   flashStatus('Session cleared.')
+}
+
+// ── Settings ──
+async function loadSettings() {
+  for (const key of Object.keys(settings)) {
+    const value = await api.getSettings(key)
+    if (value !== null) settings[key] = value
+  }
+}
+
+function updateSetting(key, value) {
+  settings[key] = value
+  api.setSettings(key, value).catch((err) => { statusMsg.value = 'Could not save settings: ' + err.message })
 }
 
 // ── API key persistence ──
@@ -189,7 +235,11 @@ async function loadApiKey() {
 async function saveApiKey() {
   const value = apiKeyInput.value.trim()
   if (!value) return
-  await api.setSettings('apiKey', value)
+  try {
+    await api.setSettings('apiKey', value)
+  } catch (err) {
+    statusMsg.value = 'Could not save the key: ' + err.message
+  }
   apiKey.value = value
   apiKeyInput.value = ''
   showKeyInput.value = false
@@ -215,17 +265,19 @@ const unsubscribers = []
 
 onMounted(() => {
   loadApiKey()
+  loadSettings()
 
   unsubscribers.push(
     api.onRealtimeTranscriptDelta(({ displayText }) => { liveTranscript.value = displayText || '' }),
     api.onRealtimeTranscriptDone(({ transcript }) => { liveTranscript.value = transcript || '' }),
     api.onRealtimeError(({ message }) => {
       console.warn('[realtime] error:', message)
-      if (isRecording.value) statusMsg.value = 'Live transcript: ' + message
+      if (isRecording.value) statusMsg.value = message
     }),
     api.onShortcutToggleRecord(() => (isRecording.value ? discardRecording() : startRecording())),
     api.onShortcutAnswer(() => answerQuestion()),
-    api.onShortcutScreen(() => analyzeScreen())
+    api.onShortcutScreen(() => analyzeScreen()),
+    api.onWindowState((state) => { clickThrough.value = state.clickThrough })
   )
 
   api.getContextStatus().then(({ hasJd, hasResume, dir }) => {
@@ -255,10 +307,14 @@ onUnmounted(() => {
         :paste-open="showPastePanel"
         :is-recording="isRecording"
         :recording-seconds="recorder.seconds.value"
+        :level="recorder.level.value"
         :has-history="answer.history.value.length > 0"
+        :settings-open="showSettings"
+        :click-through="clickThrough"
         @answer="answerQuestion"
         @analyze="analyzeScreen"
-        @toggle-paste="showPastePanel = !showPastePanel"
+        @toggle-paste="togglePanel('paste')"
+        @toggle-settings="togglePanel('settings')"
         @clear-audio="clearAudio"
         @clear-session="clearSession"
         @rec="isRecording ? answerQuestion() : startRecording()"
@@ -283,6 +339,13 @@ onUnmounted(() => {
         <button class="action-btn indigo key-save-btn" @click="saveApiKey">Save</button>
       </div>
 
+      <SettingsPanel
+        v-if="showSettings"
+        :settings="settings"
+        @update="updateSetting"
+        @close="showSettings = false"
+      />
+
       <PastePanel
         v-if="showPastePanel"
         :disabled="isBusy"
@@ -300,6 +363,8 @@ onUnmounted(() => {
       :elapsed="answer.elapsed.value"
       :latency="answer.latency.value"
       :can-stop="answer.streaming.value || phase === 'transcribing'"
+      :can-follow-up="canFollowUp"
+      @follow-up="followUp"
       @stop="stopAnswer"
       @close="closeAnswer"
     />

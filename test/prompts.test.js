@@ -28,6 +28,17 @@ describe('createTextRequestBody', () => {
     expect(body.stream).toBe(true)
   })
 
+  it('sends follow-ups as plain instructions', () => {
+    const followUp = createTextRequestBody({ model: 'm', context, question: 'Make it shorter.', isFollowUp: true })
+    expect(followUp.messages.at(-1).content).toBe('Make it shorter.')
+  })
+
+  it('adds the detailed style line and a larger token budget', () => {
+    const detailed = createTextRequestBody({ model: 'm', context, style: 'detailed', question: 'q' })
+    expect(detailed.messages[0].content).toContain('Answer style: detailed')
+    expect(detailed.max_tokens).toBeGreaterThan(body.max_tokens)
+  })
+
   it('omits missing context sections', () => {
     const bare = createTextRequestBody({ model: 'm', context: { jd: '', resume: '' }, question: 'q' })
     expect(bare.messages[0].content).toBe(SYSTEM_PROMPT)

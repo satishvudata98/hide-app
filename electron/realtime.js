@@ -1,6 +1,7 @@
 'use strict';
 
 const WebSocket = require('ws');
+const { describeSocketError } = require('./errors');
 
 const REALTIME_URL = 'wss://api.openai.com/v1/realtime?intent=transcription';
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -124,7 +125,7 @@ function createRealtimeSession(emit) {
     if (update.kind === 'completed') emit('realtime:transcript-done', { transcript: update.text });
     if (update.kind === 'error') {
       console.error('[realtime] API error:', update.message);
-      emit('realtime:error', { message: update.message });
+      emit('realtime:error', { message: `Live transcript: ${update.message}` });
     }
     if (stopWaiter) stopWaiter();
   }
@@ -163,7 +164,7 @@ function createRealtimeSession(emit) {
 
       socket.on('error', (error) => {
         console.error('[realtime] WebSocket error:', error.message);
-        emit('realtime:error', { message: error.message });
+        emit('realtime:error', { message: describeSocketError(error) });
         reject(error);
       });
 

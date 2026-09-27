@@ -9,10 +9,13 @@ const props = defineProps({
   loadingLabel: { type: String, default: '' }, // e.g. 'thinking'; empty when not loading
   elapsed: { type: Number, default: 0 },
   latency: { type: String, default: null },
-  canStop: Boolean
+  canStop: Boolean,
+  canFollowUp: Boolean
 })
 
-defineEmits(['stop', 'close'])
+defineEmits(['stop', 'close', 'follow-up'])
+
+const FOLLOW_UPS = ['shorter', 'with code', 'simpler']
 
 const bodyEl = ref(null)
 const copied = ref(false)
@@ -74,11 +77,36 @@ async function copyAnswer() {
         <span class="stage-label">{{ loadingLabel }}</span>
         <span class="blink-cursor accent">|</span>
       </div>
+
+      <div class="follow-ups" v-if="canFollowUp">
+        <button v-for="kind in FOLLOW_UPS" :key="kind" class="chip" @click="$emit('follow-up', kind)">{{ kind }}</button>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+.follow-ups {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chip {
+  -webkit-app-region: no-drag;
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(99, 102, 241, 0.20);
+  border-radius: 10px;
+  color: var(--indigo);
+  font-size: 10px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.chip:hover {
+  background: rgba(99, 102, 241, 0.18);
+}
+
 
 /* ═══════════════════════════════════════════
    CONNECTOR LINE

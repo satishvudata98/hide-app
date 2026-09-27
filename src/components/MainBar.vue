@@ -6,10 +6,13 @@ defineProps({
   pasteOpen: Boolean,
   isRecording: Boolean,
   recordingSeconds: { type: Number, default: 0 },
-  hasHistory: Boolean
+  level: { type: Number, default: 0 }, // input loudness 0..1 while recording
+  hasHistory: Boolean,
+  settingsOpen: Boolean,
+  clickThrough: Boolean
 })
 
-defineEmits(['answer', 'analyze', 'toggle-paste', 'clear-audio', 'clear-session', 'rec', 'quit'])
+defineEmits(['answer', 'analyze', 'toggle-paste', 'toggle-settings', 'clear-audio', 'clear-session', 'rec', 'quit'])
 </script>
 
 <template>
@@ -33,18 +36,51 @@ defineEmits(['answer', 'analyze', 'toggle-paste', 'clear-audio', 'clear-session'
     <div class="drag-space" title="Drag to move"></div>
 
     <div class="right-actions">
+      <span class="badge" v-if="clickThrough" title="Ctrl+Shift+X to turn off">click-through</span>
       <button class="icon-btn" v-if="isRecording" @click="$emit('clear-audio')" title="Clear recorded audio">↺</button>
       <button class="icon-btn clear-btn" v-if="hasHistory" @click="$emit('clear-session')" title="Clear session history">⊘</button>
       <div class="rec-pill" :class="isRecording ? 'active' : 'inactive'" @click="$emit('rec')">
         <span class="rec-dot" :class="{ pulsing: isRecording }"></span>
         <span class="rec-label">{{ isRecording ? recordingSeconds + 's' : 'rec' }}</span>
+        <span class="level-meter" v-if="isRecording" title="Input level">
+          <span class="level-fill" :style="{ width: Math.round(level * 100) + '%' }"></span>
+        </span>
       </div>
+      <button class="icon-btn" :class="{ active: settingsOpen }" @click="$emit('toggle-settings')" title="Settings">⚙</button>
       <button class="icon-btn exit-btn" @click="$emit('quit')" title="Exit">✕</button>
     </div>
   </div>
 </template>
 
 <style scoped>
+.badge {
+  font-size: 10px;
+  color: rgb(251, 191, 36);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+
+.level-meter {
+  width: 28px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(239, 68, 68, 0.18);
+  overflow: hidden;
+}
+
+.level-fill {
+  display: block;
+  height: 100%;
+  background: var(--red);
+  transition: width 0.1s linear;
+}
+
+.icon-btn.active {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
 /* ── Single Row ── */
 .single-row {
   display: flex;

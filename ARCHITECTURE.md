@@ -30,13 +30,14 @@ useAnswer ── openai:run ──────────────▶ ipc.js
 | `electron/capture.js` | Media permissions, loopback audio, screenshots |
 | `electron/context.js` | Loads `jd.txt` / `resume.txt`, cached by modification time |
 | `electron/settings.js` | JSON settings file in `userData` |
+| `electron/errors.js` | One-line messages for HTTP, network and socket failures (pure) |
 
 ## Renderer
 
 | File | Responsibility |
 |---|---|
 | `components/WorkspaceScreen.vue` | The state machine and the flows (record → answer, screenshot, paste) |
-| `components/MainBar.vue`, `PastePanel.vue`, `AnswerPanel.vue` | Presentational pieces |
+| `components/MainBar.vue`, `PastePanel.vue`, `SettingsPanel.vue`, `AnswerPanel.vue` | Presentational pieces |
 | `composables/useRecorder.js` | Opens system audio and mic, runs the worklet, keeps ~2 min for the fallback |
 | `composables/useAnswer.js` | One streamed answer: request id, text (rendered at most once per frame), timing, history |
 | `audio/pcm-worklet.js` | Audio-thread mixer: mono, PCM16, 100ms frames |

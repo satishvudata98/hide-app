@@ -30,17 +30,23 @@ Put `jd.txt` (job description) and `resume.txt` next to the app: the project fol
 | Answer what's on screen | `analyze screen` | `Ctrl+Shift+S` |
 | Type or paste a question | `paste text`, then `Ctrl+Enter` | |
 | Stop a streaming answer | `■` in the answer header | |
+| Rework the last answer | `shorter` / `with code` / `simpler` under it | |
+| Settings | `⚙` | |
 | Show / hide overlay | | `Ctrl+Shift+O` |
 | Click-through on/off | | `Ctrl+Shift+X` |
 | Opacity up / down | | `Ctrl+Shift+Up` / `Down` |
 
-Follow-up questions include the last two exchanges. `⊘` clears that history.
+Follow-up questions include the last two exchanges. `⊘` clears that history. While recording, the bar next to the seconds shows the input level. If it doesn't move when someone speaks, the wrong mic is selected.
 
 Hotkeys are defined in `SHORTCUTS` in [electron/window.js](electron/window.js).
 
-**No transcript?** The app uses the Windows default input device. If a headset jack is plugged in, Windows may switch to a silent "Headset Microphone".
+**Settings (`⚙`):**
+- **mic**: defaults to the Windows default input. Pick a specific one if a plugged-in headset jack makes Windows switch to a silent "Headset Microphone".
+- **system audio**: on or off.
+- **model**: answer model, default `gpt-4o`.
+- **answers**: `brief` or `detailed`.
 
-**Settings file keys:** `apiKey`, and `answerModel` (default `gpt-4o`).
+Everything is stored in the settings file together with `apiKey`.
 
 ## Build an exe
 

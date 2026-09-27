@@ -13,8 +13,10 @@ const DEFAULT_ANSWER_MODEL = 'gpt-4o'; // override with "answerModel" in the set
 const activeRequests = new Map(); // requestId → AbortController
 
 function buildAnswerRequestBody(payload) {
+  const settings = readSettings();
   const options = {
-    model: readSettings().answerModel || DEFAULT_ANSWER_MODEL,
+    model: settings.answerModel?.trim() || DEFAULT_ANSWER_MODEL,
+    style: settings.answerStyle === 'detailed' ? 'detailed' : 'brief',
     context: getContext(),
     history: Array.isArray(payload.conversationHistory) ? payload.conversationHistory : []
   };
@@ -23,7 +25,7 @@ function buildAnswerRequestBody(payload) {
   }
   const question = payload.question?.trim();
   if (!question) throw new Error('No question to answer. Record, paste text or analyze the screen first.');
-  return createTextRequestBody({ ...options, question });
+  return createTextRequestBody({ ...options, question, isFollowUp: !!payload.isFollowUp });
 }
 
 async function runAnswerRequest(sender, payload) {
