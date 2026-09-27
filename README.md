@@ -1,138 +1,63 @@
-# Windows Capture-Excluded Electron Overlay
+# Screnshield
 
-This project is a minimal Electron desktop application for Windows that creates a floating overlay window and asks the OS to exclude it from capture pipelines by calling `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)`.
+A personal Windows overlay that answers interview questions. It listens to system audio and the mic, transcribes live with the OpenAI Realtime API, and streams an answer from an OpenAI chat model. It uses your `resume.txt` and `jd.txt` as context. It can also answer from pasted text or a screenshot.
 
-## What it does
+Electron + Vue 3 + Vite. Windows 10 (2004+) / Windows 11.
 
-- Creates a frameless, transparent, always-on-top overlay window
-- Keeps the window out of the taskbar
-- Uses a 700 x 600 floating UI with a simple parakeet-inspired recording panel
-- Makes the header draggable with CSS `-webkit-app-region: drag`
-- Prefers `ffi-napi` and `ref-napi` to call `user32.dll` directly
-- Tries to exclude the overlay from screen capture on Windows 10 version 2004+ and Windows 11
-- Records system loopback audio plus microphone or headset jack input
-- Sends audio and prompt together to OpenAI in one request, then renders transcript and response in separate sections
-- Supports global shortcuts for show/hide, click-through mode, and opacity
-
-## Install
+## Setup
 
 ```powershell
 npm install
+npm run build
 npm start
 ```
 
-If PowerShell blocks `npm.ps1`, run `npm.cmd install` and `npm.cmd start` instead.
+On first run, paste your OpenAI API key into the key field. It's saved to `%APPDATA%\Screnshield\screnshield-settings.json`. You can also set `VITE_OPENAI_API_KEY` in `.env` before building.
 
-If Electron starts in Node mode and errors with `app.whenReady` being undefined, clear `ELECTRON_RUN_AS_NODE` before launching:
+Put `jd.txt` (job description) and `resume.txt` next to the app: the project folder in dev, the exe's folder when packaged. The status line tells you if either is missing. Edits are picked up on the next question.
 
-```powershell
-Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
-npm start
-```
+**Dev with hot reload:** run `npm run dev` in one terminal and `npm run start:dev` in another. Close any running Screnshield first, because an old process keeps serving old code.
 
-## Notes on native dependencies
+**`app.whenReady` is undefined?** VS Code terminals set `ELECTRON_RUN_AS_NODE`. Run `Remove-Item Env:ELECTRON_RUN_AS_NODE` first.
 
-- `ffi-napi` and `ref-napi` are optional dependencies so `npm install` can still complete on machines without a full native build toolchain
-- When the native modules are available, the app calls `user32!SetWindowDisplayAffinity` directly
-- When they are not available, the app falls back to Electron's `win.setContentProtection(true)`, which Electron documents as calling `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` on Windows
-- If `ffi-napi` needs to compile locally, you may need Visual Studio with the "Desktop development with C++" workload
+## Using it
 
-## Shortcuts
+| Action | Button | Hotkey |
+|---|---|---|
+| Start recording | `rec` | `Ctrl+Shift+Space` |
+| Stop recording and answer | `rec` (while recording) / `answer question` | `Ctrl+Shift+Enter` |
+| Discard the current recording | | `Ctrl+Shift+Space` (while recording) |
+| Answer what's on screen | `analyze screen` | `Ctrl+Shift+S` |
+| Type or paste a question | `paste text`, then `Ctrl+Enter` | |
+| Stop a streaming answer | `■` in the answer header | |
+| Show / hide overlay | | `Ctrl+Shift+O` |
+| Click-through on/off | | `Ctrl+Shift+X` |
+| Opacity up / down | | `Ctrl+Shift+Up` / `Down` |
 
-- `Ctrl+Shift+O`: Show or hide the overlay
-- `Ctrl+Shift+X`: Toggle click-through mode
-- `Ctrl+Shift+Up`: Increase opacity
-- `Ctrl+Shift+Down`: Decrease opacity
+Follow-up questions include the last two exchanges. `⊘` clears that history.
 
-## Use the recorder UI
+Hotkeys are defined in `SHORTCUTS` in [electron/window.js](electron/window.js).
 
-1. Launch the app.
-2. Enter your OpenAI API key in the UI.
-3. Optionally edit the prompt.
-4. Click `Start` to capture system audio plus mic or headset input.
-5. Click `Stop` when you are done.
-6. Click `Send` to upload the WAV buffer and prompt to OpenAI.
-7. Read the transcript and assistant response in the two output panels.
+**No transcript?** The app uses the Windows default input device. If a headset jack is plugged in, Windows may switch to a silent "Headset Microphone".
 
-Latency note:
+**Settings file keys:** `apiKey`, and `answerModel` (default `gpt-4o`).
 
-- This build uses a single OpenAI request with the `gpt-audio` model so transcription and reasoning happen together
-- For the best response time, keep each recording short
-
-## Build for Windows
-
-The most reliable option is the unpacked app folder:
+## Build an exe
 
 ```powershell
-npm run pack
+.\build.ps1              # dist\win-unpacked\Screnshield.exe
+.\build.ps1 -Portable    # dist\Screnshield-<version>-x64-portable.exe
+.\build.ps1 -Installer   # NSIS installer
 ```
 
-That creates:
+`build.ps1` runs `vite build` before packaging, so the exe never ships a stale UI.
 
-- `dist\win-unpacked\InvisibleOverlay.exe`
-
-You can double-click that `.exe` directly.
-
-You can also use the included build script:
+## Tests
 
 ```powershell
-.\build.ps1
+npm test
 ```
 
-Optional builds:
+These are unit tests for the pure logic: SSE parsing, realtime transcript assembly, WAV encoding and prompt building.
 
-```powershell
-.\build.ps1 -Portable
-npm run dist
-```
-
-That tries to create:
-
-- `dist\InvisibleOverlay-1.0.0-x64-portable.exe`
-
-For a normal installer:
-
-```powershell
-npm run dist:installer
-.\build.ps1 -Installer
-```
-
-Notes:
-
-- The app still does not create a task tray icon because no `Tray` is used anywhere in the code
-- The overlay window still does not appear in the taskbar because `skipTaskbar: true` is set on the `BrowserWindow`
-- On first build, `electron-builder` may download Windows packaging tools such as NSIS
-- On some Windows machines, the portable/installer targets can fail if the packaging tools cannot extract symlinks without elevated privileges or Developer Mode enabled
-- If that happens, use `npm run pack` or `.\build.ps1` without switches, then run `dist\win-unpacked\InvisibleOverlay.exe`
-
-## How the native window handle works
-
-Electron exposes the native top-level window handle through `win.getNativeWindowHandle()`.
-
-- On Windows, the returned `Buffer` contains the `HWND` bytes in little-endian format
-- The app converts that buffer into a pointer with `ref.readPointer(...)`
-- `ref.readPointer(...)` uses the current pointer size, so the same logic works for both 32-bit and 64-bit processes
-
-## How `SetWindowDisplayAffinity` works
-
-The app calls:
-
-```js
-SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
-```
-
-That asks the Windows compositor to keep the window visible on the local monitor while excluding it from supported capture APIs and sharing pipelines.
-
-Important notes:
-
-- `WDA_EXCLUDEFROMCAPTURE` requires Windows 10 version 2004 or newer
-- On older versions, Windows treats it like `WDA_MONITOR`
-- Microsoft documents this as content protection support, not absolute DRM-level protection
-- A top-level window is required, which is why the code applies affinity to the `BrowserWindow` handle itself
-
-## Files
-
-- `package.json`: Electron app metadata and dependencies
-- `main.js`: Window creation, native API binding, capture permissions, OpenAI request handling
-- `preload.js`: Safe bridge between the renderer and Electron main process
-- `index.html`: Recorder UI, audio mixing, WAV encoding, transcript and response rendering
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how it fits together.

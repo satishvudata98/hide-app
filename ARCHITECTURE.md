@@ -1,61 +1,66 @@
-# Screnshield Architecture & Flow Analysis
+# Architecture
 
-Screnshield is a stealth AI assistant overlay built for Windows. It provides an invisible overlay (hidden from screen capturing tools) to assist during technical interviews. It captures audio or screen content, augments the query with local context (Resume and Job Description), and queries OpenAI's advanced models to provide real-time, streaming answers.
+Two processes. They only talk through the IPC bridge in `preload.js` (`window.overlayApi`).
 
-## 1. Tech Stack
-* **Core Framework:** Electron (Node.js backend + Chromium frontend). Used for desktop window management, IPC (Inter-Process Communication), global shortcuts, and screen capture (`desktopCapturer`).
-* **Frontend Framework:** Vue 3 (Composition API) built with Vite. Provides a highly reactive, lightweight UI.
-* **Native Windows Interop:** `ffi-napi` and `ref-napi`. These are used to directly invoke the Windows `user32.dll` API to achieve the stealth capture exclusion.
-* **AI Engine:** OpenAI API. Uses `gpt-4o` for vision and text generation, and `gpt-4o-audio-preview` for native audio comprehension and response.
-* **Web Audio API:** Used in the frontend to capture microphone data, mix channels to mono, downsample to 16kHz, and encode raw PCM data into WAV format.
+```
+Renderer (Vue)                          Main (Node / Electron)
+──────────────                          ──────────────────────
+useRecorder ── PCM frames ────────────▶ realtime.js ──WebSocket──▶ OpenAI Realtime (gpt-4o-transcribe)
+   ▲  AudioWorklet (24kHz mono PCM16)       │ transcript deltas
+   │                                        ▼
+WorkspaceScreen ◀── realtime:transcript-* ──┘
+   │  question / screenshot
+   ▼
+useAnswer ── openai:run ──────────────▶ ipc.js → prompts.js → openai.js ──HTTPS SSE──▶ Chat Completions
+   ▲                                                         │
+   └──────────── openai:delta / done / error ◀───────────────┘
+```
 
----
+## Main process
 
-## 2. Component Architecture
+| File | Responsibility |
+|---|---|
+| `main.js` | App lifecycle; wires the modules together |
+| `electron/window.js` | Overlay window, global hotkeys, opacity, click-through, fit-to-content height |
+| `electron/ipc.js` | Every IPC handler; runs answer requests and tracks them for cancellation |
+| `electron/prompts.js` | System prompt and request bodies (pure) |
+| `electron/openai.js` | Streaming chat request (timeouts, one retry) and the Whisper fallback |
+| `electron/sse.js` | SSE parsing (pure) |
+| `electron/realtime.js` | Realtime WebSocket session and the transcript tracker (pure) |
+| `electron/capture.js` | Media permissions, loopback audio, screenshots |
+| `electron/context.js` | Loads `jd.txt` / `resume.txt`, cached by modification time |
+| `electron/settings.js` | JSON settings file in `userData` |
 
-### The Main Process (`main.js`)
-The backbone of the application running in Node.js.
-* **Window Management:** Creates a transparent, frameless, and non-resizable `BrowserWindow` positioned at the top-center of the screen.
-* **Stealth Mode Engine:** Uses `ffi-napi` to retrieve the native window handle (HWND) and applies `WDA_EXCLUDEFROMCAPTURE` (0x11) via `SetWindowDisplayAffinity`. This instructs the Windows desktop compositor to display the window locally but completely exclude it from any screen capture/recording APIs (like OBS, Zoom, Teams).
-* **Context Ingestion:** Reads `jd.txt` (Job Description) and `resume.txt` from the local directory dynamically to construct an expert system prompt tailored to the candidate's background.
-* **API Orchestration:** Contains REST clients for OpenAI. It formats requests based on the modality (vision, audio, text), handles the HTTP stream, parses SSE (Server-Sent Events), and forwards text chunks back to the frontend using IPC.
+## Renderer
 
-### The Preload Script (`preload.js`)
-Acts as a secure Context Bridge between the Node.js backend and the Vue frontend.
-* Exposes `window.overlayApi`, ensuring the renderer cannot directly access Node.js APIs or the file system.
-* Handles bi-directional IPC channels like `openai:run`, `app:capture-screen`, and streams events like `openai:delta`.
+| File | Responsibility |
+|---|---|
+| `components/WorkspaceScreen.vue` | The state machine and the flows (record → answer, screenshot, paste) |
+| `components/MainBar.vue`, `PastePanel.vue`, `AnswerPanel.vue` | Presentational pieces |
+| `composables/useRecorder.js` | Opens system audio and mic, runs the worklet, keeps ~2 min for the fallback |
+| `composables/useAnswer.js` | One streamed answer: request id, text (rendered at most once per frame), timing, history |
+| `audio/pcm-worklet.js` | Audio-thread mixer: mono, PCM16, 100ms frames |
+| `lib/markdown.js`, `lib/wav.js` | Sanitized markdown + highlighting; WAV encoding |
 
-### The Renderer Process (`WorkspaceScreen.vue`)
-The reactive UI layer.
-* **State Machine:** Manages states: `idle`, `recording`, and `answering`.
-* **Audio Pipeline:** When recording starts, it initializes an `AudioContext`, captures audio via a `ScriptProcessorNode`, mixes channels to mono, and accumulates audio chunks in memory.
-* **WAV Encoding:** Upon stopping, it downsamples the collected audio array to 16kHz, encodes it into a standard WAV buffer, converts it to base64, and sends it to the main process.
-* **Dynamic UI Resizing:** Uses a `ResizeObserver` on the root DOM element. As the AI streams its answer back, the text grows; Vue dynamically sends an IPC call to the main process to resize the native Electron window height to perfectly fit the newly rendered content.
+## State machine
 
----
+`phase` in `WorkspaceScreen` covers everything before an answer streams. The stream itself is `answer.streaming`.
 
-## 3. End-to-End Application Flow
+```
+idle ──rec──▶ recording ──answer──▶ finalizing ──transcript──────────────▶ (answer streams) ──▶ idle
+                  │                     └──no transcript──▶ transcribing (Whisper) ──▶ (answer streams)
+                  └──discard──▶ idle
+idle ──analyze screen──▶ capturing ──▶ (answer streams) ──▶ idle
+```
 
-### Flow 1: Stealth Initialization
-1. **Launch:** The user runs the Electron app.
-2. **Window Creation:** `main.js` creates a frameless, transparent window.
-3. **Capture Exclusion:** `main.js` converts the Electron window handle to a raw pointer and invokes `SetWindowDisplayAffinity(hwnd, 0x11)`. The window becomes invisible to screen recording tools.
-4. **UI Load:** `WorkspaceScreen.vue` loads via Vite. The UI is a minimal control bar at the top of the screen.
+While any phase other than `idle`/`recording` is active, or an answer is streaming, the actions are disabled. That rules out overlapping flows.
 
-### Flow 2: Audio Question Pipeline
-1. **Record:** User clicks the "rec" pill (or presses `PageUp`).
-2. **Audio Capture:** The Vue frontend accesses the system microphone via `navigator.mediaDevices.getUserMedia` and continuously stores audio chunks.
-3. **Submit:** User clicks "Answer Question" (or presses `PageDown`).
-4. **Processing:** Vue stops the recording, downsamples the audio, encodes it to a base64 WAV file, and sends an `openai:run` IPC message containing the audio data.
-5. **Context Building:** `main.js` receives the IPC. It reads `jd.txt` and `resume.txt` and concatenates them with a strict system prompt instructing the AI to act as an expert interview assistant.
-6. **AI Request:** `main.js` sends the payload to OpenAI's `gpt-4o-audio-preview` model.
-7. **Streaming:** As OpenAI streams the answer back, `main.js` parses the JSON stream, extracts text deltas, and fires `openai:delta` events to the renderer.
-8. **Display:** `WorkspaceScreen.vue` appends the text to the UI. The `ResizeObserver` detects the height change and tells `main.js` to expand the window downwards so the text remains visible.
+## Key flows
 
-### Flow 3: Screen Analysis Pipeline
-1. **Trigger:** User clicks "Analyze Screen" on the UI.
-2. **Capture IPC:** Vue calls `window.overlayApi.captureScreen()`.
-3. **Desktop Capture:** `main.js` uses Electron's `desktopCapturer` to take a 1080p screenshot of the primary display. It converts the frame to a base64 PNG.
-4. **AI Request:** `main.js` packages the image base64, the JD/Resume context, and the system prompt, sending it to OpenAI's `gpt-4o` vision model.
-5. **Streaming:** The vision model analyzes the code or technical question on the screen and streams the answer back via `openai:delta` IPC messages.
-6. **Display:** The frontend renders the streaming answer in real-time, auto-resizing the window exactly like the audio flow.
+**Live transcription.** The WebSocket stays open between recordings. Starting a new recording sends `input_audio_buffer.clear` and ignores events until `input_audio_buffer.cleared` arrives, so leftovers can't leak into the next question. Server VAD commits segments as the speaker pauses. The tracker keys segments by `item_id` and joins them in commit order.
+
+**Stopping.** `realtime.stop()` commits only if speech is still open. It resolves as soon as every committed segment has its final text, or after 3s at most. If there's no transcript, the renderer sends the retained audio to Whisper.
+
+**Answer requests.** The system message is prompt + JD + resume, a stable prefix that OpenAI can cache. It's followed by the last 2 exchanges and the question (or the screenshot). The request has a 30s timeout for headers and a 20s idle timeout between chunks. It retries once on 429/5xx/network errors before anything has streamed. Deltas carry the full text so far.
+
+**Screenshots.** The display under the cursor, at native aspect ratio, long side ≤ 2048px, sent as JPEG.

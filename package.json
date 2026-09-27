@@ -1,12 +1,13 @@
 {
-  "name": "windows-capture-excluded-overlay",
+  "name": "screnshield",
   "version": "1.0.0",
-  "description": "Minimal Electron overlay for Windows that stays visible locally while requesting capture exclusion via SetWindowDisplayAffinity.",
+  "description": "Personal Windows overlay that answers interview questions from live audio, pasted text or a screenshot, using OpenAI.",
   "productName": "Screnshield",
   "main": "main.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "vitest run",
     "start": "electron .",
     "start:dev": "set VITE_DEV_SERVER_URL=http://localhost:5173&& electron .",
     "pack": "electron-builder --dir",
@@ -17,8 +18,7 @@
     "electron",
     "overlay",
     "windows",
-    "screen-capture",
-    "ffi"
+    "openai"
   ],
   "author": "",
   "license": "MIT",
@@ -30,23 +30,21 @@
     "highlight.js": "^11.11.1",
     "marked": "^18.0.4",
     "vite": "^8.0.8",
+    "vitest": "^5.0.2",
     "vue": "^3.5.32"
   },
   "dependencies": {
     "ws": "^8.18.0"
   },
-  "optionalDependencies": {
-    "ffi-napi": "^4.0.3",
-    "ref-napi": "^3.0.3"
-  },
   "build": {
-    "appId": "com.vsatish.invisibleoverlay",
+    "appId": "com.vsatish.screnshield",
     "productName": "Screnshield",
     "asar": true,
     "npmRebuild": false,
     "files": [
       "main.js",
       "preload.js",
+      "electron/**/*",
       "dist-vue/**/*",
       "package.json"
     ],
