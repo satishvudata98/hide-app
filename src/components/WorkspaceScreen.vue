@@ -24,8 +24,8 @@ hljs.registerLanguage('typescript', typescript)
 hljs.registerLanguage('bash', bash)
 hljs.registerLanguage('sql', sql)
 
-// ── State machine: idle → recording → transcribing → answering ──
-const appState = ref('idle') // 'idle' | 'recording' | 'transcribing' | 'answering'
+// ── State machine: idle → recording → finalizing → transcribing → answering ──
+const appState = ref('idle') // 'idle' | 'recording' | 'finalizing' | 'transcribing' | 'answering'
 const transcriptText = ref('')
 const answerText = ref('')
 const detectedQuestion = ref('')
@@ -41,7 +41,11 @@ const liveTranscript = ref('')
 const showPastePanel = ref(false)
 const pasteText = ref('')
 
+const SCREEN_HISTORY_QUESTION = '[Screenshot: question shown on screen]'
+const MAX_FALLBACK_AUDIO_SECONDS = 120
+
 let requestId = null
+let historyQuestion = '' // what gets stored as the user turn once the answer completes
 let answerTimer = null
 let answerStartTime = 0
 let resizeObserver = null
@@ -50,6 +54,7 @@ let recordingTimer = null
 // ── Computed ──
 const isRecording = computed(() => appState.value === 'recording')
 const isAnswering = computed(() => ['transcribing', 'answering'].includes(appState.value))
+const isBusy = computed(() => ['finalizing', 'transcribing', 'answering'].includes(appState.value))
 
 // ── Markdown rendering ──
 const renderedAnswer = computed(() => {
@@ -221,11 +226,14 @@ async function startRecording() {
     })
 
     const captureRate = audioContext.sampleRate
+    const maxFallbackChunks = Math.ceil((MAX_FALLBACK_AUDIO_SECONDS * captureRate) / 4096)
 
     processor.onaudioprocess = (e) => {
       if (appState.value !== 'recording') return
       const mono = mixToMono(e.inputBuffer)
-      audioChunks.push(mono) // retained for Whisper fallback
+      // Retained for the Whisper fallback; only the most recent ~2 minutes are kept
+      audioChunks.push(mono)
+      if (audioChunks.length > maxFallbackChunks) audioChunks.shift()
       window.overlayApi?.sendRealtimeAudioChunk({ audioBase64: floatToPcm16Base64(mono, captureRate) })
     }
 
@@ -253,179 +261,147 @@ function stopRecording() {
   window.overlayApi?.closeRealtimeSession()
 }
 
-// ── Answer Question ──
-async function answerQuestion() {
-  if (!apiKey.value) {
-    statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
-    return
-  }
+// ── Answer lifecycle helpers ──
+function clearAnswerTimer() {
+  if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+}
 
-  // Cancel any in-flight request before starting a new one
-  if (requestId && isAnswering.value) {
-    window.overlayApi?.cancelRequest?.(requestId)
-    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
-  }
-
-  let audioBase64 = null
-  let capturedSampleRate = 48000
-
-  if (appState.value === 'recording') {
-    capturedSampleRate = audioContext?.sampleRate || 48000
-    stopAudioCapture()
-    appState.value = 'idle'
-    liveTranscript.value = ''
-
-    // Commit realtime buffer and wait up to 3s for final transcript
-    statusMsg.value = 'Finalizing transcript...'
-    try {
-      const result = await window.overlayApi.stopRealtimeSession()
-      window.overlayApi.closeRealtimeSession()
-      const transcribed = result?.transcript?.trim() || ''
-      if (transcribed) {
-        transcriptText.value = transcribed
-      }
-    } catch (err) {
-      window.overlayApi?.closeRealtimeSession()
-      console.warn('[realtime] transcript unavailable, falling back to Whisper:', err.message)
-    }
-
-    // Whisper fallback if realtime produced no transcript
-    if (!transcriptText.value.trim() && audioChunks.length > 0) {
-      statusMsg.value = 'Processing audio...'
-      const merged = mergeChunks(audioChunks)
-      const downsampled = downsample(merged, capturedSampleRate, 16000)
-      const wavBuffer = encodeWav(downsampled, 16000)
-      audioBase64 = await arrayBufferToBase64(wavBuffer)
-    }
-  }
-
-  const text = transcriptText.value.trim()
-
-  if (!text && !audioBase64) {
-    statusMsg.value = 'No transcript or audio to analyze.'
-    return
-  }
-
+function beginAnswerPanel(question) {
+  detectedQuestion.value = question
   answerText.value = ''
   answerError.value = ''
   showAnswer.value = true
   answerStartTime = Date.now()
   answerElapsed.value = 0
   responseLatency.value = null
-
+  clearAnswerTimer()
   answerTimer = setInterval(() => {
     answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
   }, 500)
+}
 
+function sendAnswerRequest(payload, questionForHistory) {
   requestId = `req_${Date.now()}`
+  historyQuestion = questionForHistory
+  statusMsg.value = 'Thinking...'
+  appState.value = 'answering'
+  window.overlayApi.runOpenAiRequest({
+    requestId,
+    apiKey: apiKey.value,
+    format: 'text',
+    conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value)),
+    ...payload
+  })
+}
 
-  if (audioBase64) {
-    // ── Two-stage: Whisper transcription first, then GPT-4o answer ──
-    appState.value = 'transcribing'
-    statusMsg.value = 'Transcribing...'
-    detectedQuestion.value = ''
+// Stops the realtime session and returns the final transcript, or a WAV
+// (base64) of the retained audio when realtime produced nothing.
+async function finalizeRecording() {
+  const capturedSampleRate = audioContext?.sampleRate || 48000
+  stopAudioCapture()
+  liveTranscript.value = ''
+  appState.value = 'finalizing'
+  statusMsg.value = 'Finalizing transcript...'
 
-    if (!window.overlayApi) return
-
-    const result = await window.overlayApi.transcribeAudio({ apiKey: apiKey.value, audioBase64, format: 'wav' })
-
-    if (result.error) {
-      statusMsg.value = 'Transcription failed: ' + result.error
-      if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
-      appState.value = 'idle'
-      return
-    }
-
-    const transcribed = result.text?.trim() || ''
-    if (!transcribed) {
-      statusMsg.value = 'No speech detected. Try again.'
-      if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
-      appState.value = 'idle'
-      return
-    }
-
-    transcriptText.value = transcribed
-    detectedQuestion.value = transcribed
-    statusMsg.value = 'Thinking...'
-    appState.value = 'answering'
-
-    window.overlayApi.runOpenAiRequest({
-      requestId,
-      apiKey: apiKey.value,
-      transcribedText: transcribed,
-      format: 'text',
-      conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value))
-    })
-  } else {
-    // ── Text mode ──
-    detectedQuestion.value = text
-    statusMsg.value = 'Thinking...'
-    appState.value = 'answering'
-
-    if (window.overlayApi) {
-      window.overlayApi.runOpenAiRequest({
-        requestId,
-        apiKey: apiKey.value,
-        transcribedText: text,
-        format: 'text',
-        conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value))
-      })
-    }
+  let transcript = ''
+  try {
+    const result = await window.overlayApi.stopRealtimeSession()
+    transcript = result?.transcript?.trim() || ''
+  } catch (err) {
+    console.warn('[realtime] transcript unavailable, falling back to Whisper:', err.message)
   }
+  window.overlayApi.closeRealtimeSession()
+
+  if (transcript || !audioChunks.length) return { transcript, audioBase64: null }
+
+  statusMsg.value = 'Processing audio...'
+  const downsampled = downsample(mergeChunks(audioChunks), capturedSampleRate, 16000)
+  return { transcript: '', audioBase64: await arrayBufferToBase64(encodeWav(downsampled, 16000)) }
+}
+
+async function transcribeWithWhisper(audioBase64) {
+  appState.value = 'transcribing'
+  statusMsg.value = 'Transcribing...'
+  const result = await window.overlayApi.transcribeAudio({ apiKey: apiKey.value, audioBase64, format: 'wav' })
+  const text = result.text?.trim() || ''
+  if (result.error) statusMsg.value = 'Transcription failed: ' + result.error
+  else if (!text) statusMsg.value = 'No speech detected. Try again.'
+  return text
+}
+
+// ── Answer Question ──
+async function answerQuestion() {
+  if (isBusy.value || !window.overlayApi) return
+  if (!apiKey.value) {
+    statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
+    return
+  }
+
+  let audioBase64 = null
+  if (appState.value === 'recording') {
+    const finalized = await finalizeRecording()
+    if (finalized.transcript) transcriptText.value = finalized.transcript
+    audioBase64 = finalized.audioBase64
+    appState.value = 'idle'
+  }
+
+  let question = transcriptText.value.trim()
+  if (!question && !audioBase64) {
+    statusMsg.value = 'No transcript or audio to analyze.'
+    return
+  }
+
+  beginAnswerPanel(question)
+
+  if (!question) {
+    question = await transcribeWithWhisper(audioBase64)
+    if (appState.value !== 'transcribing') return // stopped or closed meanwhile
+    if (!question) {
+      clearAnswerTimer()
+      appState.value = 'idle'
+      return
+    }
+    transcriptText.value = question
+    detectedQuestion.value = question
+  }
+
+  sendAnswerRequest({ transcribedText: question }, question)
 }
 
 // ── Analyze Screen ──
 async function analyzeScreen() {
+  if (isBusy.value || isRecording.value || !window.overlayApi?.captureScreen) return
   if (!apiKey.value) {
     statusMsg.value = 'API key missing. Set VITE_OPENAI_API_KEY in .env.'
     return
   }
 
   showPastePanel.value = false
-
-  if (requestId && isAnswering.value) {
-    window.overlayApi?.cancelRequest?.(requestId)
-    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
-  }
-
+  appState.value = 'answering'
   statusMsg.value = 'Capturing screen...'
-
-  if (!window.overlayApi?.captureScreen) {
-    statusMsg.value = 'Screen capture not available.'
-    return
-  }
 
   const result = await window.overlayApi.captureScreen()
   if (result.error) {
     statusMsg.value = 'Capture failed: ' + result.error
+    appState.value = 'idle'
     return
   }
 
-  detectedQuestion.value = 'Screen analysis'
-  answerText.value = ''
-  answerError.value = ''
-  showAnswer.value = true
-  appState.value = 'answering'
-  answerStartTime = Date.now()
-  answerElapsed.value = 0
-  responseLatency.value = null
-  statusMsg.value = 'Thinking...'
+  beginAnswerPanel('Screen analysis')
+  sendAnswerRequest(
+    { transcribedText: '', imageBase64: result.imageBase64, imageType: result.imageType || 'jpeg' },
+    SCREEN_HISTORY_QUESTION
+  )
+}
 
-  answerTimer = setInterval(() => {
-    answerElapsed.value = Math.round((Date.now() - answerStartTime) / 1000)
-  }, 500)
-
-  requestId = `req_${Date.now()}`
-
-  window.overlayApi.runOpenAiRequest({
-    requestId,
-    apiKey: apiKey.value,
-    transcribedText: transcriptText.value.trim() || '',
-    imageBase64: result.imageBase64,
-    imageType: result.imageType || 'jpeg',
-    format: 'text',
-    conversationHistory: JSON.parse(JSON.stringify(conversationHistory.value))
-  })
+// ── Stop / close answer ──
+function stopAnswer() {
+  if (requestId) window.overlayApi?.cancelRequest?.(requestId)
+  requestId = null
+  clearAnswerTimer()
+  if (isAnswering.value) appState.value = 'idle'
+  statusMsg.value = ''
+  if (!answerText.value) answerError.value = 'Stopped.'
 }
 
 // ── Copy answer ──
@@ -442,13 +418,13 @@ async function copyAnswer() {
 
 // ── Close answer ──
 function closeAnswer() {
+  stopAnswer()
   showAnswer.value = false
   answerText.value = ''
+  answerError.value = ''
   detectedQuestion.value = ''
   responseLatency.value = null
-  if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
   answerElapsed.value = 0
-  appState.value = 'idle'
 }
 
 // ── Clear audio ──
@@ -538,14 +514,15 @@ onMounted(() => {
     const finalText = p.text || answerText.value
     answerText.value = finalText
     responseLatency.value = ((Date.now() - answerStartTime) / 1000).toFixed(1) + 's'
-    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+    clearAnswerTimer()
     appState.value = 'idle'
+    requestId = null
     if (!finalText) {
       answerError.value = 'No response received — check your API key or try again.'
     }
-    if (detectedQuestion.value && finalText) {
+    if (historyQuestion && finalText) {
       conversationHistory.value.push(
-        { role: 'user', content: detectedQuestion.value },
+        { role: 'user', content: historyQuestion },
         { role: 'assistant', content: finalText }
       )
       if (conversationHistory.value.length > 4) {
@@ -559,33 +536,38 @@ onMounted(() => {
     if (p.requestId && p.requestId !== requestId) return
     answerError.value = p.message || 'Request failed.'
     statusMsg.value = ''
-    if (answerTimer) { clearInterval(answerTimer); answerTimer = null }
+    clearAnswerTimer()
     appState.value = 'idle'
+    requestId = null
   })
 
-  if (window.overlayApi.onRealtimeTranscriptDelta) {
-    window.overlayApi.onRealtimeTranscriptDelta((p) => {
-      liveTranscript.value = p.displayText || ''
-    })
-    window.overlayApi.onRealtimeTranscriptDone((p) => {
-      liveTranscript.value = p.transcript || ''
-    })
-    window.overlayApi.onRealtimeError((p) => {
-      console.warn('[realtime] error:', p.message)
-    })
-  }
+  window.overlayApi.onRealtimeTranscriptDelta((p) => {
+    liveTranscript.value = p.displayText || ''
+  })
+  window.overlayApi.onRealtimeTranscriptDone((p) => {
+    liveTranscript.value = p.transcript || ''
+  })
+  window.overlayApi.onRealtimeError((p) => {
+    console.warn('[realtime] error:', p.message)
+    if (isRecording.value) statusMsg.value = 'Live transcript: ' + p.message
+  })
+  window.overlayApi.onSystemError((p) => {
+    statusMsg.value = p.message
+  })
 
-  if (window.overlayApi.onShortcutPageUp) {
-    window.overlayApi.onShortcutPageUp(() => {
-      if (isRecording.value) stopRecording()
-      else startRecording()
-    })
-    window.overlayApi.onShortcutPageDown(() => {
-      if (!isAnswering.value && (transcriptText.value.trim() || isRecording.value)) {
-        answerQuestion()
-      }
-    })
-  }
+  window.overlayApi.onShortcutToggleRecord(() => {
+    if (isRecording.value) stopRecording()
+    else startRecording()
+  })
+  window.overlayApi.onShortcutAnswer(() => {
+    if (transcriptText.value.trim() || isRecording.value) answerQuestion()
+  })
+  window.overlayApi.onShortcutScreen(() => analyzeScreen())
+
+  window.overlayApi.getContextStatus().then(({ hasJd, hasResume, dir }) => {
+    const missing = [!hasJd && 'jd.txt', !hasResume && 'resume.txt'].filter(Boolean)
+    if (missing.length) statusMsg.value = `${missing.join(' and ')} not found in ${dir}`
+  })
 
   nextTick(() => {
     if (rootEl.value) {
@@ -634,15 +616,15 @@ watch(renderedAnswer, async () => {
 
       <div class="single-row">
         <div class="left-actions">
-          <button class="action-btn indigo" @click="answerQuestion" :disabled="isAnswering || (!transcriptText.trim() && !isRecording)">
+          <button class="action-btn indigo" @click="answerQuestion" :disabled="isBusy || (!transcriptText.trim() && !isRecording)">
             <span class="action-icon">☰</span>
             <span>answer question</span>
           </button>
-          <button class="action-btn green" @click="analyzeScreen" :disabled="isAnswering">
+          <button class="action-btn green" @click="analyzeScreen" :disabled="isBusy || isRecording">
             <span class="action-icon">◻</span>
             <span>analyze screen</span>
           </button>
-          <button class="action-btn amber" :class="{ active: showPastePanel }" @click="showPastePanel = !showPastePanel" :disabled="isAnswering">
+          <button class="action-btn amber" :class="{ active: showPastePanel }" @click="showPastePanel = !showPastePanel" :disabled="isBusy">
             <span class="action-icon">✎</span>
             <span>paste text</span>
           </button>
@@ -698,7 +680,7 @@ watch(renderedAnswer, async () => {
         ></textarea>
         <div class="paste-footer">
           <span class="paste-hint">Ctrl+Enter to submit</span>
-          <button class="action-btn indigo" @click="submitPasteText" :disabled="!pasteText.trim() || isAnswering">
+          <button class="action-btn indigo" @click="submitPasteText" :disabled="!pasteText.trim() || isBusy">
             <span>analyze</span>
           </button>
         </div>
@@ -720,6 +702,7 @@ watch(renderedAnswer, async () => {
         <button class="icon-btn copy-btn" @click="copyAnswer" :title="copied ? 'Copied!' : 'Copy answer'" v-if="answerText">
           {{ copied ? '✓' : '⎘' }}
         </button>
+        <button class="icon-btn stop-btn" @click="stopAnswer" title="Stop" v-if="isAnswering">■</button>
         <button class="icon-btn close-btn" @click="closeAnswer" title="Close">✕</button>
       </div>
 
@@ -1083,6 +1066,15 @@ watch(renderedAnswer, async () => {
 
 .close-btn:hover {
   color: var(--text-primary);
+}
+
+.stop-btn {
+  font-size: 10px;
+}
+
+.stop-btn:hover {
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.12);
 }
 
 .answer-body {

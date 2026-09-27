@@ -30,6 +30,21 @@ const OPACITY_STEP = 0.1;
 const MIN_OPACITY = 0.75;
 const MAX_OPACITY = 1.0;
 const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+const HEADERS_TIMEOUT_MS = 30_000;
+const STREAM_IDLE_TIMEOUT_MS = 20_000;
+const WHISPER_TIMEOUT_MS = 30_000;
+const REALTIME_STOP_TIMEOUT_MS = 3_000;
+
+// Global hotkeys. Change here if any of these clash with another app.
+const SHORTCUTS = {
+  toggleVisibility: 'CommandOrControl+Shift+O',
+  toggleClickThrough: 'CommandOrControl+Shift+X',
+  opacityUp: 'CommandOrControl+Shift+Up',
+  opacityDown: 'CommandOrControl+Shift+Down',
+  toggleRecord: 'CommandOrControl+Shift+Space',
+  answer: 'CommandOrControl+Shift+Enter',
+  analyzeScreen: 'CommandOrControl+Shift+S'
+};
 
 let overlayWindow = null;
 let isClickThrough = false;
@@ -38,10 +53,15 @@ let currentOpacity = 1.0;
 const activeRequests = new Map(); // requestId → AbortController
 
 let realtimeWs = null;
-let realtimeConfirmedTranscript = '';
-let realtimeDraftTranscript = '';
 let realtimeAudioQueue = [];
-let realtimeStopResolver = null;
+// Transcript segments keyed by item_id, kept in commit order so late or
+// out-of-order completions still assemble correctly.
+let realtimeItems = new Map(); // item_id → { text, done }
+let realtimeOrder = [];
+let realtimeAwaitingCommit = false; // speech started (or manual commit sent) but not yet committed
+let realtimeVadSeen = false; // server VAD reported speech at least once this session
+let realtimeHasUncommittedAudio = false;
+let realtimeStopWaiter = null; // (force?) => void, re-checked whenever an item changes
 
 function getSettingsPath() {
   return path.join(app.getPath('userData'), 'screnshield-settings.json');
@@ -218,20 +238,13 @@ function adjustOpacity(delta) {
 
 function registerShortcuts() {
   const bindings = [
-    ['CommandOrControl+Shift+O', toggleOverlayVisibility],
-    ['CommandOrControl+Shift+X', toggleClickThrough],
-    ['CommandOrControl+Shift+Up', () => adjustOpacity(OPACITY_STEP)],
-    ['CommandOrControl+Shift+Down', () => adjustOpacity(-OPACITY_STEP)],
-    ['PageUp', () => {
-      if (overlayWindow && !overlayWindow.isDestroyed()) {
-        overlayWindow.webContents.send('shortcut:pageup');
-      }
-    }],
-    ['PageDown', () => {
-      if (overlayWindow && !overlayWindow.isDestroyed()) {
-        overlayWindow.webContents.send('shortcut:pagedown');
-      }
-    }]
+    [SHORTCUTS.toggleVisibility, toggleOverlayVisibility],
+    [SHORTCUTS.toggleClickThrough, toggleClickThrough],
+    [SHORTCUTS.opacityUp, () => adjustOpacity(OPACITY_STEP)],
+    [SHORTCUTS.opacityDown, () => adjustOpacity(-OPACITY_STEP)],
+    [SHORTCUTS.toggleRecord, () => emitToRenderer('shortcut:toggle-record')],
+    [SHORTCUTS.answer, () => emitToRenderer('shortcut:answer')],
+    [SHORTCUTS.analyzeScreen, () => emitToRenderer('shortcut:screen')]
   ];
 
   for (const [accelerator, handler] of bindings) {
@@ -304,27 +317,33 @@ RULES:
 - Never mention being an AI or assistant
 - For screen/image analysis: focus only on code and technical questions visible; ignore faces and PII`;
 
+function getContextDir() {
+  if (!app.isPackaged) return __dirname;
+  // The portable build runs from a temp extraction folder; this env var points
+  // at the folder the user actually launched the exe from.
+  return process.env.PORTABLE_EXECUTABLE_DIR || path.dirname(app.getPath('exe'));
+}
+
+const contextCache = new Map(); // fileName → { mtimeMs, text }
+
+function readContextFile(fileName) {
+  const filePath = path.join(getContextDir(), fileName);
+  try {
+    const { mtimeMs } = fs.statSync(filePath);
+    const cached = contextCache.get(fileName);
+    if (cached && cached.mtimeMs === mtimeMs) return cached.text;
+    const text = fs.readFileSync(filePath, 'utf8');
+    contextCache.set(fileName, { mtimeMs, text });
+    return text;
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.warn(`Failed to read ${fileName}`, error);
+    contextCache.delete(fileName);
+    return '';
+  }
+}
+
 function getContextFiles() {
-  let jd = '';
-  let resume = '';
-
-  const baseDir = app.isPackaged ? path.dirname(app.getPath('exe')) : __dirname;
-
-  try {
-    const jdPath = path.join(baseDir, 'jd.txt');
-    if (fs.existsSync(jdPath)) jd = fs.readFileSync(jdPath, 'utf8');
-  } catch (e) {
-    console.warn('Failed to read jd.txt', e);
-  }
-
-  try {
-    const resumePath = path.join(baseDir, 'resume.txt');
-    if (fs.existsSync(resumePath)) resume = fs.readFileSync(resumePath, 'utf8');
-  } catch (e) {
-    console.warn('Failed to read resume.txt', e);
-  }
-
-  return { jd, resume };
+  return { jd: readContextFile('jd.txt'), resume: readContextFile('resume.txt') };
 }
 
 function buildExpertUserContent(userText, includeContext = true) {
@@ -357,7 +376,7 @@ function createTextRequestBody(systemPrompt, userText, conversationHistory = [])
   };
 }
 
-function createVisionRequestBody(systemPrompt, userText, imageBase64, imageType = 'png') {
+function createVisionRequestBody(systemPrompt, userText, imageBase64, imageType = 'png', conversationHistory = []) {
   return {
     model: 'gpt-4o',
     stream: true,
@@ -368,6 +387,7 @@ function createVisionRequestBody(systemPrompt, userText, imageBase64, imageType 
         role: 'system',
         content: EXPERT_SYSTEM_PROMPT
       },
+      ...conversationHistory.slice(-4),
       {
         role: 'user',
         content: [
@@ -470,7 +490,7 @@ function extractTextDelta(parsedChunk) {
   return extractTextFromContent(message.content);
 }
 
-async function readStreamedCompletion(response, sender, requestId) {
+async function readStreamedCompletion(response, sender, requestId, onChunk) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -482,6 +502,8 @@ async function readStreamedCompletion(response, sender, requestId) {
     if (done) {
       break;
     }
+
+    onChunk();
 
     buffer += decoder.decode(value, { stream: true });
     const events = buffer.split('\n\n');
@@ -556,7 +578,7 @@ async function runOpenAiRequest(sender, payload) {
 
   let requestBody;
   if (isVisionRequest) {
-    requestBody = createVisionRequestBody(prompt, transcribedText || '', imageBase64, imageType);
+    requestBody = createVisionRequestBody(prompt, transcribedText || '', imageBase64, imageType, conversationHistory);
   } else if (isTextRequest) {
     requestBody = createTextRequestBody(prompt, transcribedText, conversationHistory);
   } else {
@@ -566,13 +588,19 @@ async function runOpenAiRequest(sender, payload) {
   const controller = new AbortController();
   activeRequests.set(requestId, controller);
 
-  let timedOut = false;
-  const timeoutId = setTimeout(() => { timedOut = true; controller.abort(); }, 60_000);
+  // One timer, re-armed as the request progresses: first waiting for headers,
+  // then waiting between stream chunks. Whichever fires records why.
+  let timeoutReason = null;
+  let timer = null;
+  const armTimer = (ms, reason) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { timeoutReason = reason; controller.abort(); }, ms);
+  };
 
   console.log(`[openai] request started: ${requestId}`);
 
   try {
-    const response = await fetch(OPENAI_API_URL, {
+    const response = await fetchWithRetry(OPENAI_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -580,8 +608,7 @@ async function runOpenAiRequest(sender, payload) {
       },
       body: JSON.stringify(requestBody),
       signal: controller.signal
-    });
-    clearTimeout(timeoutId);
+    }, () => armTimer(HEADERS_TIMEOUT_MS, 'headers'));
 
     console.log(`[openai] response: ${response.status} ${response.headers.get('content-type')}`);
 
@@ -590,21 +617,50 @@ async function runOpenAiRequest(sender, payload) {
       throw new Error(`OpenAI request failed (${response.status}): ${errorText}`);
     }
 
+    armTimer(STREAM_IDLE_TIMEOUT_MS, 'idle');
     const contentType = response.headers.get('content-type') || '';
     const finalText = contentType.includes('text/event-stream')
-      ? await readStreamedCompletion(response, sender, requestId)
+      ? await readStreamedCompletion(response, sender, requestId, () => armTimer(STREAM_IDLE_TIMEOUT_MS, 'idle'))
       : await readNonStreamCompletion(response);
 
     console.log(`[openai] done: ${finalText.length} chars`);
     sender.send('openai:done', { requestId, text: finalText || '' });
   } catch (error) {
-    if (error.name === 'AbortError' && timedOut) {
-      throw new Error('Request timed out (60s). Check your network and try again.');
+    if (error.name === 'AbortError' && timeoutReason === 'headers') {
+      throw new Error(`No response from OpenAI after ${HEADERS_TIMEOUT_MS / 1000}s. Check your network and try again.`);
+    }
+    if (error.name === 'AbortError' && timeoutReason === 'idle') {
+      throw new Error(`Answer stream stalled for ${STREAM_IDLE_TIMEOUT_MS / 1000}s and was stopped. Try again.`);
     }
     throw error;
   } finally {
-    clearTimeout(timeoutId);
+    clearTimeout(timer);
     activeRequests.delete(requestId);
+  }
+}
+
+function isRetryableStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+// Retries once on a network error or a 429/5xx. Only covers the phase before
+// any token is streamed, so a retry never duplicates visible output.
+async function fetchWithRetry(url, options, onAttempt) {
+  for (let attempt = 0; ; attempt++) {
+    onAttempt();
+    const isLastAttempt = attempt >= 1;
+    try {
+      const response = await fetch(url, options);
+      if (isLastAttempt || !isRetryableStatus(response.status)) return response;
+      console.warn(`[openai] ${response.status}, retrying once`);
+    } catch (error) {
+      if (error.name === 'AbortError' || isLastAttempt) throw error;
+      console.warn(`[openai] network error, retrying once: ${error.message}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    if (options.signal?.aborted) {
+      throw Object.assign(new Error('Request aborted.'), { name: 'AbortError' });
+    }
   }
 }
 
@@ -704,7 +760,8 @@ function registerIpcHandlers() {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': `multipart/form-data; boundary=${boundary}`
         },
-        body
+        body,
+        signal: AbortSignal.timeout(WHISPER_TIMEOUT_MS)
       });
 
       if (!response.ok) {
@@ -715,8 +772,16 @@ function registerIpcHandlers() {
       const result = await response.json();
       return { text: result.text || '' };
     } catch (error) {
+      if (error.name === 'TimeoutError') {
+        return { text: '', error: `Whisper did not respond within ${WHISPER_TIMEOUT_MS / 1000}s.` };
+      }
       return { text: '', error: error.message || 'Whisper transcription error.' };
     }
+  });
+
+  ipcMain.handle('context:status', () => {
+    const { jd, resume } = getContextFiles();
+    return { dir: getContextDir(), hasJd: !!jd.trim(), hasResume: !!resume.trim() };
   });
 
   // ── Realtime transcription via OpenAI Realtime API (WebSocket) ──
@@ -725,10 +790,8 @@ function registerIpcHandlers() {
       try { realtimeWs.close(); } catch {}
       realtimeWs = null;
     }
-    realtimeConfirmedTranscript = '';
-    realtimeDraftTranscript = '';
+    resetRealtimeTranscript();
     realtimeAudioQueue = [];
-    realtimeStopResolver = null;
     console.log('[realtime] starting session...');
 
     return new Promise((resolve, reject) => {
@@ -772,41 +835,8 @@ function registerIpcHandlers() {
       ws.on('message', (data) => {
         let event;
         try { event = JSON.parse(data.toString()); } catch { return; }
-
-        // Log every event so we can see the exact schema
-        console.log('[realtime] event:', event.type, event.error ? JSON.stringify(event.error) : '');
-
-        if (event.type === 'session.created' || event.type === 'session.updated') {
-          console.log('[realtime] session object:', JSON.stringify(event.session));
-        }
-
-        if (event.type === 'conversation.item.added' || event.type === 'conversation.item.done') {
-          console.log('[realtime] item:', JSON.stringify(event.item));
-        }
-
-        if (event.type === 'error') {
-          console.error('[realtime] API error:', JSON.stringify(event.error));
-          emitToRenderer('realtime:error', { message: event.error?.message || 'Realtime API error' });
-        }
-
-        if (event.type === 'conversation.item.input_audio_transcription.delta') {
-          realtimeDraftTranscript += event.delta || '';
-          emitToRenderer('realtime:transcript-delta', {
-            delta: event.delta,
-            displayText: realtimeConfirmedTranscript + realtimeDraftTranscript
-          });
-        }
-
-        if (event.type === 'conversation.item.input_audio_transcription.completed') {
-          realtimeConfirmedTranscript += (event.transcript || '') + ' ';
-          realtimeDraftTranscript = '';
-          const full = realtimeConfirmedTranscript.trim();
-          emitToRenderer('realtime:transcript-done', { transcript: full });
-          if (realtimeStopResolver) {
-            realtimeStopResolver(full);
-            realtimeStopResolver = null;
-          }
-        }
+        if (realtimeWs !== ws) return; // late event from a replaced session
+        handleRealtimeEvent(event);
       });
 
       ws.on('error', (err) => {
@@ -817,17 +847,16 @@ function registerIpcHandlers() {
 
       ws.on('close', () => {
         clearTimeout(openTimeout);
-        if (realtimeWs === ws) realtimeWs = null;
-        if (realtimeStopResolver) {
-          realtimeStopResolver((realtimeConfirmedTranscript + realtimeDraftTranscript).trim());
-          realtimeStopResolver = null;
-        }
+        if (realtimeWs !== ws) return;
+        realtimeWs = null;
+        if (realtimeStopWaiter) realtimeStopWaiter(true);
       });
     });
   });
 
   ipcMain.on('realtime:audio-chunk', (_event, { audioBase64 }) => {
     if (!realtimeWs) return;
+    realtimeHasUncommittedAudio = true;
     if (realtimeWs.readyState === WebSocket.OPEN) {
       realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: audioBase64 }));
     } else if (realtimeWs.readyState === WebSocket.CONNECTING) {
@@ -835,34 +864,122 @@ function registerIpcHandlers() {
     }
   });
 
-  ipcMain.handle('realtime:stop', () => {
-    return new Promise((resolve) => {
-      if (!realtimeWs || realtimeWs.readyState !== WebSocket.OPEN) {
-        resolve({ transcript: (realtimeConfirmedTranscript + realtimeDraftTranscript).trim() });
-        return;
-      }
+  // Resolves once every committed segment has its final transcript, so the
+  // tail of the question is not lost. Returns immediately when nothing is pending.
+  ipcMain.handle('realtime:stop', () => new Promise((resolve) => {
+    let timeout = null;
+    const finish = () => {
+      clearTimeout(timeout);
+      realtimeStopWaiter = null;
+      resolve({ transcript: getRealtimeTranscript() });
+    };
+
+    if (!realtimeWs || realtimeWs.readyState !== WebSocket.OPEN) {
+      finish();
+      return;
+    }
+
+    // With server VAD the buffer is usually already committed once the speaker
+    // pauses; only commit when speech is still open (or VAD never reported).
+    const vadMissing = !realtimeVadSeen && realtimeHasUncommittedAudio;
+    if (realtimeAwaitingCommit || vadMissing) {
+      realtimeAwaitingCommit = true;
       realtimeWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-      const timeout = setTimeout(() => {
-        realtimeStopResolver = null;
-        resolve({ transcript: (realtimeConfirmedTranscript + realtimeDraftTranscript).trim() });
-      }, 3000);
-      realtimeStopResolver = (transcript) => {
-        clearTimeout(timeout);
-        resolve({ transcript });
-      };
-    });
-  });
+    }
+
+    if (!hasPendingRealtimeItems()) {
+      finish();
+      return;
+    }
+
+    timeout = setTimeout(finish, REALTIME_STOP_TIMEOUT_MS);
+    realtimeStopWaiter = (force = false) => {
+      if (force || !hasPendingRealtimeItems()) finish();
+    };
+  }));
 
   ipcMain.on('realtime:close', () => {
-    realtimeStopResolver = null;
+    realtimeStopWaiter = null;
     if (realtimeWs) {
       try { realtimeWs.close(); } catch {}
       realtimeWs = null;
     }
-    realtimeConfirmedTranscript = '';
-    realtimeDraftTranscript = '';
+    resetRealtimeTranscript();
     realtimeAudioQueue = [];
   });
+}
+
+function resetRealtimeTranscript() {
+  realtimeItems = new Map();
+  realtimeOrder = [];
+  realtimeAwaitingCommit = false;
+  realtimeVadSeen = false;
+  realtimeHasUncommittedAudio = false;
+}
+
+function getRealtimeItem(itemId) {
+  if (!realtimeItems.has(itemId)) {
+    realtimeItems.set(itemId, { text: '', done: false });
+    realtimeOrder.push(itemId);
+  }
+  return realtimeItems.get(itemId);
+}
+
+function getRealtimeTranscript() {
+  return realtimeOrder
+    .map((id) => realtimeItems.get(id).text.trim())
+    .filter(Boolean)
+    .join(' ');
+}
+
+function hasPendingRealtimeItems() {
+  return realtimeAwaitingCommit || realtimeOrder.some((id) => !realtimeItems.get(id).done);
+}
+
+function handleRealtimeEvent(event) {
+  switch (event.type) {
+    case 'input_audio_buffer.speech_started':
+      realtimeVadSeen = true;
+      realtimeAwaitingCommit = true;
+      break;
+
+    case 'input_audio_buffer.committed':
+      realtimeAwaitingCommit = false;
+      realtimeHasUncommittedAudio = false;
+      getRealtimeItem(event.item_id);
+      break;
+
+    case 'conversation.item.input_audio_transcription.delta':
+      getRealtimeItem(event.item_id).text += event.delta || '';
+      emitToRenderer('realtime:transcript-delta', { displayText: getRealtimeTranscript() });
+      break;
+
+    case 'conversation.item.input_audio_transcription.completed': {
+      const item = getRealtimeItem(event.item_id);
+      item.text = event.transcript || '';
+      item.done = true;
+      emitToRenderer('realtime:transcript-done', { transcript: getRealtimeTranscript() });
+      break;
+    }
+
+    case 'conversation.item.input_audio_transcription.failed':
+      getRealtimeItem(event.item_id).done = true;
+      console.warn('[realtime] transcription failed:', JSON.stringify(event.error));
+      break;
+
+    case 'error':
+      // A commit on an empty buffer is expected when VAD already committed it.
+      realtimeAwaitingCommit = false;
+      if (event.error?.code === 'input_audio_buffer_commit_empty' || /buffer only has/i.test(event.error?.message || '')) break;
+      console.error('[realtime] API error:', JSON.stringify(event.error));
+      emitToRenderer('realtime:error', { message: event.error?.message || 'Realtime API error' });
+      break;
+
+    default:
+      return;
+  }
+
+  if (realtimeStopWaiter) realtimeStopWaiter();
 }
 
 function createWindow() {
