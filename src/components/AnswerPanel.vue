@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, watch, nextTick } from 'vue'
-import { renderMarkdown, highlightCodeBlocks } from '../lib/markdown'
+import { renderMarkdown, highlightCodeBlocks, isWaitAnswer } from '../lib/markdown'
 
 const props = defineProps({
   question: { type: String, default: '' },
@@ -13,28 +13,29 @@ const props = defineProps({
   canFollowUp: Boolean
 })
 
-defineEmits(['stop', 'close', 'follow-up'])
+defineEmits(['stop', 'close', 'follow-up', 'regenerate'])
 
-const FOLLOW_UPS = ['shorter', 'with code', 'simpler']
+// label → hotkey hint
+const FOLLOW_UPS = [['shorter', 'Ctrl+Shift+1'], ['deeper', 'Ctrl+Shift+2'], ['with code', 'Ctrl+Shift+3']]
+const HEARD_MAX_CHARS = 140
 
 const bodyEl = ref(null)
 const copied = ref(false)
-let stickToBottom = true // auto-scroll only while the reader is at the bottom
 
-const html = computed(() => renderMarkdown(props.text))
-
-watch(html, async () => {
-  if (!props.text) stickToBottom = true // a new answer starts at the bottom
-  await nextTick()
-  if (!bodyEl.value) return
-  highlightCodeBlocks(bodyEl.value)
-  if (stickToBottom) bodyEl.value.scrollTop = bodyEl.value.scrollHeight
+const waiting = computed(() => isWaitAnswer(props.text))
+const html = computed(() => (waiting.value ? '' : renderMarkdown(props.text)))
+// The end of what was heard: the question is almost always at the end of the block
+const heard = computed(() => {
+  const text = props.question.replace(/\s+/g, ' ').trim()
+  return text.length > HEARD_MAX_CHARS ? '…' + text.slice(-HEARD_MAX_CHARS).replace(/^\S*\s/, '') : text
 })
 
-function onScroll() {
-  const el = bodyEl.value
-  stickToBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40
-}
+// The Say line comes first, so the view stays at the top while the rest streams in
+watch(() => props.question, () => { if (bodyEl.value) bodyEl.value.scrollTop = 0 })
+watch(html, async () => {
+  await nextTick()
+  if (bodyEl.value) highlightCodeBlocks(bodyEl.value)
+})
 
 async function copyAnswer() {
   try {
@@ -65,11 +66,13 @@ async function copyAnswer() {
       <button class="icon-btn close-btn" @click="$emit('close')" title="Close">✕</button>
     </div>
 
-    <div class="answer-body" ref="bodyEl" @scroll="onScroll">
-      <div class="detected-question" v-if="question">"{{ question }}"</div>
+    <div class="answer-body" ref="bodyEl">
+      <div class="detected-question" v-if="heard" :title="question">heard: {{ heard }}</div>
 
       <!-- Streaming answer rendered as sanitized markdown -->
       <div class="answer-md" v-if="html" v-html="html"></div>
+
+      <div class="answer-waiting" v-if="waiting">No question yet. Keep listening and press again once it's asked.</div>
 
       <div class="answer-error" v-if="error">{{ error }}</div>
 
@@ -78,8 +81,9 @@ async function copyAnswer() {
         <span class="blink-cursor accent">|</span>
       </div>
 
-      <div class="follow-ups" v-if="canFollowUp">
-        <button v-for="kind in FOLLOW_UPS" :key="kind" class="chip" @click="$emit('follow-up', kind)">{{ kind }}</button>
+      <div class="follow-ups" v-if="canFollowUp && !waiting">
+        <button v-for="[kind, hotkey] in FOLLOW_UPS" :key="kind" class="chip" :title="hotkey" @click="$emit('follow-up', kind)">{{ kind }}</button>
+        <button class="chip" title="Ctrl+Shift+R" @click="$emit('regenerate')">↻ again</button>
       </div>
     </div>
   </div>
@@ -196,14 +200,14 @@ async function copyAnswer() {
 }
 
 .detected-question {
-  font-style: italic;
   font-size: 11px;
   color: var(--text-hint);
   margin-bottom: 8px;
-  line-height: 1.5;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* ── Markdown answer ── */
@@ -236,15 +240,39 @@ async function copyAnswer() {
   margin-bottom: 5px;
 }
 
+/* The line to say first: biggest and brightest thing on screen */
+.answer-md :deep(p.say) {
+  font-size: 14.5px;
+  line-height: 1.5;
+  font-weight: 500;
+  color: var(--text-bright);
+  margin-bottom: 9px;
+}
+
+/* Supporting points: quieter, their bold key term carries the scan */
 .answer-md :deep(ul),
 .answer-md :deep(ol) {
   padding-left: 1.4em;
   margin-bottom: 6px;
+  color: rgba(255, 255, 255, 0.74);
 }
 
 .answer-md :deep(li) {
   margin-bottom: 3px;
   line-height: 1.55;
+}
+
+/* [placeholder] the candidate fills in with their own real fact */
+.answer-md :deep(.fill) {
+  color: rgb(251, 191, 36);
+  border-bottom: 1px dashed rgba(251, 191, 36, 0.6);
+  padding: 0 1px;
+}
+
+.answer-waiting {
+  font-size: 11.5px;
+  color: var(--text-hint);
+  padding: 2px 0;
 }
 
 .answer-md :deep(strong) {

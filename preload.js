@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('overlayApi', {
   // Answers
   runOpenAiRequest: (payload) => ipcRenderer.send('openai:run', payload),
   cancelRequest: (requestId) => ipcRenderer.send('openai:cancel', requestId),
+  clearConversation: () => ipcRenderer.invoke('conversation:clear'),
   onOpenAiDelta: (callback) => subscribe('openai:delta', callback),
   onOpenAiDone: (callback) => subscribe('openai:done', callback),
   onOpenAiError: (callback) => subscribe('openai:error', callback),
@@ -42,5 +43,7 @@ contextBridge.exposeInMainWorld('overlayApi', {
   // Global hotkeys
   onShortcutToggleListen: (callback) => subscribe('shortcut:toggle-listen', callback),
   onShortcutAnswer: (callback) => subscribe('shortcut:answer', callback),
-  onShortcutScreen: (callback) => subscribe('shortcut:screen', callback)
+  onShortcutScreen: (callback) => subscribe('shortcut:screen', callback),
+  onShortcutRegenerate: (callback) => subscribe('shortcut:regenerate', callback),
+  onShortcutFollowUp: (callback) => subscribe('shortcut:follow-up', callback) // payload: 'shorter' | 'deeper' | 'with code'
 });

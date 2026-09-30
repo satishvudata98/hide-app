@@ -8,11 +8,10 @@ import { useRecorder } from '../composables/useRecorder'
 import { useAnswer } from '../composables/useAnswer'
 
 const api = window.overlayApi
-const SCREEN_HISTORY_QUESTION = '[Screenshot: question shown on screen]'
 const FOLLOW_UP_INSTRUCTIONS = {
   shorter: 'Make that answer shorter: one or two sentences I can say right away.',
-  'with code': 'Add a short, working code example to that answer.',
-  simpler: 'Explain that answer more simply, in plain words.'
+  deeper: 'Go one level deeper on that answer: more technical detail and the trade-offs, still easy to say out loud.',
+  'with code': 'Add a short, working code example to that answer.'
 }
 
 // ── API key ──
@@ -40,17 +39,19 @@ const settings = reactive({
   systemAudio: true,
   includeMic: false,
   autoListen: true,
+  vadSilenceMs: 300,
   answerModel: '',
   answerStyle: 'brief'
 })
 const AUDIO_SETTINGS = ['micDeviceId', 'systemAudio', 'includeMic']
+const SEND_DEBOUNCE_MS = 300
 
 const recorder = useRecorder()
 const answer = useAnswer()
 
 const isBusy = computed(() => phase.value !== 'idle' || answer.streaming.value)
 const canFollowUp = computed(() =>
-  !isBusy.value && !!answer.latency.value && !!answer.text.value && answer.history.value.length > 0
+  !isBusy.value && !!answer.latency.value && !!answer.text.value && answer.exchangeCount.value > 0
 )
 const loadingLabel = computed(() => {
   if (phase.value === 'transcribing') return 'transcribing audio'
@@ -122,10 +123,14 @@ function resetBlock() {
 // ── Answering ──
 // Sends everything heard since the last answer. Listening never stops. When
 // the live transcript is unavailable, the audio since the last send goes to
-// Whisper instead.
+// Whisper instead. Sending while an answer streams replaces it (the
+// interviewer moved on); a block with nothing new leaves it alone.
+let lastSendAt = 0
 async function answerQuestion() {
-  if (isBusy.value || !requireApiKey()) return
+  if (phase.value !== 'idle' || !requireApiKey()) return
   const pressedAt = Date.now()
+  if (pressedAt - lastSendAt < SEND_DEBOUNCE_MS) return // double press
+  lastSendAt = pressedAt
   showPastePanel.value = false
 
   phase.value = 'finalizing'
@@ -138,26 +143,15 @@ async function answerQuestion() {
     block = { text: '', degraded: true }
   }
   let question = block.text?.trim() || ''
+  const wav = block.degraded ? takeWav() : null
 
-  if (!block.degraded) {
-    phase.value = 'idle'
-    if (!question) {
-      flashStatus(listen.value === 'on' ? 'Nothing new heard since the last answer.' : 'Not listening. Press Ctrl+Shift+Space.')
-      return
-    }
-    answer.begin(question, { pressedAt, kind: 'audio' })
-    answer.send(apiKey.value, { question }, question)
-    return
-  }
-
-  const wav = takeWav()
   if (!wav) {
     phase.value = 'idle'
     if (question) {
       answer.begin(question, { pressedAt, kind: 'audio' })
-      answer.send(apiKey.value, { question }, question)
+      answer.send(apiKey.value, { question, turnKind: 'interviewer' })
     } else {
-      flashStatus('Nothing heard since the last answer.')
+      flashStatus(listen.value === 'on' ? 'Nothing new heard since the last answer.' : 'Not listening. Press Ctrl+Shift+Space.')
     }
     return
   }
@@ -173,14 +167,14 @@ async function answerQuestion() {
     return
   }
   answer.question.value = question
-  answer.send(apiKey.value, { question }, question)
+  answer.send(apiKey.value, { question, turnKind: 'interviewer' })
 }
 
 function answerPastedText(text) {
-  if (isBusy.value || !requireApiKey()) return
+  if (phase.value !== 'idle' || !requireApiKey()) return
   showPastePanel.value = false
   answer.begin(text, { kind: 'paste' })
-  answer.send(apiKey.value, { question: text }, text)
+  answer.send(apiKey.value, { question: text, turnKind: 'pasted' })
 }
 
 async function analyzeScreen() {
@@ -200,14 +194,19 @@ async function analyzeScreen() {
   }
 
   answer.begin('Screen analysis', { pressedAt, kind: 'screen' })
-  answer.send(apiKey.value, { imageBase64: result.imageBase64, imageType: result.imageType }, SCREEN_HISTORY_QUESTION)
+  answer.send(apiKey.value, { imageBase64: result.imageBase64, imageType: result.imageType })
 }
 
 function followUp(kind) {
   if (!canFollowUp.value || !requireApiKey()) return
   const instruction = FOLLOW_UP_INSTRUCTIONS[kind]
   answer.begin(`↳ ${kind}`, { kind: 'follow-up' })
-  answer.send(apiKey.value, { question: instruction, isFollowUp: true }, instruction)
+  answer.send(apiKey.value, { question: instruction, turnKind: 'request' })
+}
+
+function regenerate() {
+  if (phase.value !== 'idle' || !requireApiKey()) return
+  if (!answer.regenerate(apiKey.value)) flashStatus('Nothing to regenerate yet.')
 }
 
 function stopAnswer() {
@@ -251,6 +250,7 @@ async function updateSetting(key, value) {
     return
   }
   if (AUDIO_SETTINGS.includes(key)) restartListening()
+  if (key === 'vadSilenceMs' && listen.value === 'on') api.startRealtimeSession({ apiKey: apiKey.value }).catch(() => {})
 }
 
 // ── API key persistence ──
@@ -310,6 +310,8 @@ onMounted(async () => {
     api.onShortcutToggleListen(() => toggleListening()),
     api.onShortcutAnswer(() => answerQuestion()),
     api.onShortcutScreen(() => analyzeScreen()),
+    api.onShortcutRegenerate(() => regenerate()),
+    api.onShortcutFollowUp((kind) => followUp(kind)),
     api.onWindowState((state) => { clickThrough.value = state.clickThrough })
   )
 
@@ -337,15 +339,15 @@ onUnmounted(() => {
   <div class="overlay-root" ref="rootEl">
     <div class="main-bar">
       <MainBar
-        :can-answer="!isBusy"
+        :can-answer="phase === 'idle'"
         :can-analyze="!isBusy"
-        :can-paste="!isBusy"
+        :can-paste="phase === 'idle'"
         :paste-open="showPastePanel"
         :listen="listen"
         :connection="connection"
         :level="recorder.level.value"
         :has-pending="!!pendingText"
-        :has-history="answer.history.value.length > 0"
+        :has-history="answer.exchangeCount.value > 0"
         :settings-open="showSettings"
         :click-through="clickThrough"
         @answer="answerQuestion"
@@ -385,7 +387,7 @@ onUnmounted(() => {
 
       <PastePanel
         v-if="showPastePanel"
-        :disabled="isBusy"
+        :disabled="phase !== 'idle'"
         @submit="answerPastedText"
         @close="showPastePanel = false"
       />
@@ -402,6 +404,7 @@ onUnmounted(() => {
       :can-stop="answer.streaming.value || phase === 'transcribing'"
       :can-follow-up="canFollowUp"
       @follow-up="followUp"
+      @regenerate="regenerate"
       @stop="stopAnswer"
       @close="closeAnswer"
     />

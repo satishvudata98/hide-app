@@ -27,6 +27,7 @@ function buildTraceRecord({ kind, pressedAt, blockReadyAt, firstRenderAt, blockC
     ok: !!ok,
     error: error || undefined,
     model: timing.model,
+    fallback: timing.fallback || undefined,
     attempts: timing.attempts,
     blockChars,
     promptTokens: usage.prompt_tokens,

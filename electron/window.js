@@ -17,7 +17,11 @@ const SHORTCUTS = {
   opacityDown: 'CommandOrControl+Shift+Down',
   toggleListen: 'CommandOrControl+Shift+Space', // pause / resume listening
   answer: 'CommandOrControl+Shift+Enter', // answer everything heard since the last answer
-  analyzeScreen: 'CommandOrControl+Shift+S'
+  analyzeScreen: 'CommandOrControl+Shift+S',
+  regenerate: 'CommandOrControl+Shift+R',
+  shorter: 'CommandOrControl+Shift+1',
+  deeper: 'CommandOrControl+Shift+2',
+  withCode: 'CommandOrControl+Shift+3'
 };
 
 let overlayWindow = null;
@@ -90,7 +94,11 @@ function registerShortcuts() {
     [SHORTCUTS.opacityDown, () => adjustOpacity(-OPACITY_STEP)],
     [SHORTCUTS.toggleListen, () => emitToRenderer('shortcut:toggle-listen')],
     [SHORTCUTS.answer, () => emitToRenderer('shortcut:answer')],
-    [SHORTCUTS.analyzeScreen, () => emitToRenderer('shortcut:screen')]
+    [SHORTCUTS.analyzeScreen, () => emitToRenderer('shortcut:screen')],
+    [SHORTCUTS.regenerate, () => emitToRenderer('shortcut:regenerate')],
+    [SHORTCUTS.shorter, () => emitToRenderer('shortcut:follow-up', 'shorter')],
+    [SHORTCUTS.deeper, () => emitToRenderer('shortcut:follow-up', 'deeper')],
+    [SHORTCUTS.withCode, () => emitToRenderer('shortcut:follow-up', 'with code')]
   ];
 
   for (const [accelerator, handler] of bindings) {

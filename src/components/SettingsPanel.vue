@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 
 const props = defineProps({
-  settings: { type: Object, required: true } // { micDeviceId, systemAudio, includeMic, autoListen, answerModel, answerStyle }
+  settings: { type: Object, required: true } // { micDeviceId, systemAudio, includeMic, autoListen, vadSilenceMs, answerModel, answerStyle }
 })
 const emit = defineEmits(['update', 'close'])
 
@@ -70,6 +70,19 @@ onUnmounted(() => navigator.mediaDevices.removeEventListener('devicechange', loa
         </option>
       </select>
     </label>
+
+    <div class="field">
+      <span class="field-label">pause</span>
+      <div class="segmented">
+        <button
+          v-for="ms in [300, 500, 700]"
+          :key="ms"
+          :class="{ selected: (settings.vadSilenceMs || 300) === ms }"
+          @click="emit('update', 'vadSilenceMs', ms)"
+        >{{ ms }}ms</button>
+      </div>
+      <span class="field-hint">silence that ends a phrase; shorter is faster</span>
+    </div>
 
     <label class="field">
       <span class="field-label">auto listen</span>

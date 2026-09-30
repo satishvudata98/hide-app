@@ -1,9 +1,8 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 
-const HISTORY_MESSAGES = 4 // last 2 question/answer exchanges
-
-// One streamed answer at a time: request lifecycle, streamed text, timing,
-// and the short conversation history used for follow-up questions.
+// One streamed answer at a time: request lifecycle, streamed text and timing.
+// The conversation itself lives in the main process; exchangeCount only
+// drives the UI (follow-up buttons, clear-session).
 export function useAnswer() {
   const visible = ref(false)
   const question = ref('') // shown above the answer
@@ -12,15 +11,15 @@ export function useAnswer() {
   const streaming = ref(false)
   const elapsed = ref(0)
   const latency = ref(null)
-  const history = ref([])
+  const exchangeCount = ref(0)
 
   let requestId = null
-  let historyQuestion = '' // stored as the user turn once the answer completes
   let startTime = 0
   let timer = null
   let pendingText = ''
   let renderFrame = null
   let trace = null // timestamps for the current answer, written to traces.jsonl when it ends
+  let last = null // { displayQuestion, payload, completedId }: the latest request, for regenerate
 
   function stopTimer() {
     clearInterval(timer)
@@ -53,6 +52,7 @@ export function useAnswer() {
   // Opens the panel and starts the clock at `pressedAt` (the hotkey press, so
   // transcription wait counts too). `kind` labels the trace: audio/paste/screen/follow-up.
   function begin(displayQuestion, { pressedAt = Date.now(), kind = 'text' } = {}) {
+    if (requestId) window.overlayApi.cancelRequest(requestId) // a new question replaces an answer still streaming
     finish()
     visible.value = true
     question.value = displayQuestion
@@ -66,17 +66,23 @@ export function useAnswer() {
     timer = setInterval(() => { elapsed.value = Math.round((Date.now() - startTime) / 1000) }, 500)
   }
 
-  function send(apiKey, payload, questionForHistory) {
+  // payload: { question, turnKind: 'interviewer' | 'pasted' | 'request' } or { imageBase64, imageType }
+  function send(apiKey, payload) {
     requestId = `req_${Date.now()}`
-    historyQuestion = questionForHistory
     streaming.value = true
+    last = { displayQuestion: question.value, payload, completedId: null }
     if (trace) Object.assign(trace, { blockReadyAt: Date.now(), blockChars: payload.question?.length ?? 0 })
-    window.overlayApi.runOpenAiRequest({
-      requestId,
-      apiKey,
-      conversationHistory: JSON.parse(JSON.stringify(history.value)),
-      ...payload
-    })
+    window.overlayApi.runOpenAiRequest({ requestId, apiKey, ...payload })
+  }
+
+  // Asks the latest question again. A completed answer is replaced in the
+  // conversation; one still streaming or failed is simply retried.
+  function regenerate(apiKey) {
+    if (!last) return false
+    const { displayQuestion, payload, completedId } = last
+    begin(displayQuestion, { kind: 'regenerate' })
+    send(apiKey, { ...payload, replaces: completedId })
+    return true
   }
 
   function fail(message) {
@@ -103,7 +109,8 @@ export function useAnswer() {
   }
 
   function clearHistory() {
-    history.value = []
+    exchangeCount.value = 0
+    window.overlayApi.clearConversation()
   }
 
   function writeTrace(ok, timing, message) {
@@ -112,26 +119,23 @@ export function useAnswer() {
     trace = null
   }
 
-  function onDone({ requestId: id, text: finalText, timing }) {
+  function onDone({ requestId: id, text: finalText, timing, exchanges }) {
     if (id !== requestId) return
+    if (last) last.completedId = id
     finish()
     text.value = finalText || pendingText
     const doneAt = Date.now()
     if (trace && !trace.firstRenderAt && text.value) trace.firstRenderAt = doneAt
     const seconds = (at) => ((at - startTime) / 1000).toFixed(1) + 's'
-    latency.value = trace?.firstRenderAt
+    latency.value = (trace?.firstRenderAt
       ? `first words ${seconds(trace.firstRenderAt)} · done ${seconds(doneAt)}`
-      : seconds(doneAt)
+      : seconds(doneAt)) + (timing?.fallback ? ` · ${timing.model}` : '')
     writeTrace(!!text.value, timing, text.value ? undefined : 'empty response')
     if (!text.value) {
       error.value = 'No response received — check your API key or try again.'
       return
     }
-    history.value = [
-      ...history.value,
-      { role: 'user', content: historyQuestion },
-      { role: 'assistant', content: text.value }
-    ].slice(-HISTORY_MESSAGES)
+    exchangeCount.value = exchanges ?? exchangeCount.value + 1
   }
 
   function onError({ requestId: id, message, timing }) {
@@ -143,8 +147,8 @@ export function useAnswer() {
   const unsubscribers = []
   onMounted(() => {
     unsubscribers.push(
-      window.overlayApi.onOpenAiDelta(({ requestId: id, text: textSoFar }) => {
-        if (id === requestId) scheduleText(textSoFar)
+      window.overlayApi.onOpenAiDelta(({ requestId: id, delta }) => {
+        if (id === requestId) scheduleText(pendingText + delta)
       }),
       window.overlayApi.onOpenAiDone(onDone),
       window.overlayApi.onOpenAiError(onError)
@@ -155,5 +159,5 @@ export function useAnswer() {
     unsubscribers.forEach((unsubscribe) => unsubscribe())
   })
 
-  return { visible, question, text, error, streaming, elapsed, latency, history, begin, send, fail, stop, close, clearHistory }
+  return { visible, question, text, error, streaming, elapsed, latency, exchangeCount, begin, send, regenerate, fail, stop, close, clearHistory }
 }

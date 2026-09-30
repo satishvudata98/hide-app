@@ -12,6 +12,7 @@ const path = require('node:path');
 const { createRealtimeSession } = require('../electron/realtime');
 const { streamChatCompletion, transcribeWithWhisper } = require('../electron/openai');
 const { createTextRequestBody } = require('../electron/prompts');
+const { createConversation } = require('../electron/conversation');
 const { percentile } = require('../electron/trace');
 const { loadApiKey, loadContext, readWav, wavBuffer, wordErrorRate } = require('./lib');
 
@@ -72,23 +73,26 @@ async function main() {
 
   const results = [];
   const answers = [];
-  const history = [];
+  const conversation = createConversation();
   let nextSend = 0;
   let sentMs = 0;
   let sinceSend = []; // audio chunks since the last send, for the Whisper fallback
   let startedAt = Date.now();
 
   async function answer(result, question) {
-    const body = createTextRequestBody({ model, context, history, question });
+    const turn = conversation.prepareTurn({ kind: 'interviewer', text: question });
+    const body = createTextRequestBody({ model, context, history: conversation.messages(), turn });
     const timing = {};
     try {
-      const text = await streamChatCompletion({ apiKey, body, controller: new AbortController(), timing, onDelta: () => {} });
+      const text = await streamChatCompletion({
+        apiKey, body, controller: new AbortController(), timing, onDelta: () => {}, retry: { attempts: 8, maxWaitMs: 60_000 }
+      });
       result.firstTokenMs = timing.firstTokenAt - result.pressedAt;
       result.modelTtftMs = timing.firstTokenAt - timing.requestSentAt;
       result.doneMs = Date.now() - result.pressedAt;
       result.cachedTokens = timing.usage?.prompt_tokens_details?.cached_tokens;
       result.answer = text;
-      history.push({ role: 'user', content: question }, { role: 'assistant', content: text });
+      conversation.add(turn, text);
     } catch (error) {
       result.answerError = error.message;
     }
