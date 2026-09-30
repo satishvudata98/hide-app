@@ -92,9 +92,15 @@ function registerIpcHandlers(realtime) {
     return transcribeWithWhisper({ apiKey: apiKey.trim(), wav });
   });
 
-  ipcMain.handle('realtime:start', (_event, { apiKey }) => realtime.start(apiKey));
+  // Always-on listening: start is idempotent (also applies setting changes),
+  // take-block returns everything heard since the last send.
+  ipcMain.handle('realtime:start', (_event, { apiKey }) => {
+    const vadSilenceMs = Number(readSettings().vadSilenceMs) || undefined;
+    return realtime.start(apiKey, { vadSilenceMs });
+  });
   ipcMain.on('realtime:audio-chunk', (_event, pcm) => realtime.appendAudio(pcm));
-  ipcMain.handle('realtime:stop', () => realtime.stop());
+  ipcMain.handle('realtime:take-block', () => realtime.takeBlock());
+  ipcMain.handle('realtime:reset-block', () => realtime.resetBlock());
 }
 
 module.exports = { registerIpcHandlers };

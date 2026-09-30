@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 
 const props = defineProps({
-  settings: { type: Object, required: true } // { micDeviceId, systemAudio, answerModel, answerStyle }
+  settings: { type: Object, required: true } // { micDeviceId, systemAudio, includeMic, autoListen, answerModel, answerStyle }
 })
 const emit = defineEmits(['update', 'close'])
 
@@ -50,6 +50,18 @@ onUnmounted(() => navigator.mediaDevices.removeEventListener('devicechange', loa
     </div>
 
     <label class="field">
+      <span class="field-label">system audio</span>
+      <input type="checkbox" :checked="settings.systemAudio" @change="emit('update', 'systemAudio', $event.target.checked)" />
+      <span class="field-hint">what the interviewer says through your speakers/earphones</span>
+    </label>
+
+    <label class="field">
+      <span class="field-label">mic too</span>
+      <input type="checkbox" :checked="settings.includeMic" @change="emit('update', 'includeMic', $event.target.checked)" />
+      <span class="field-hint">only for in-person or phone interviews (it also hears you)</span>
+    </label>
+
+    <label class="field" v-if="settings.includeMic">
       <span class="field-label">mic</span>
       <select class="field-input" :value="settings.micDeviceId" @change="emit('update', 'micDeviceId', $event.target.value)">
         <option value="">Windows default</option>
@@ -60,9 +72,9 @@ onUnmounted(() => navigator.mediaDevices.removeEventListener('devicechange', loa
     </label>
 
     <label class="field">
-      <span class="field-label">system audio</span>
-      <input type="checkbox" :checked="settings.systemAudio" @change="emit('update', 'systemAudio', $event.target.checked)" />
-      <span class="field-hint">capture what the interviewer says through your speakers/earphones</span>
+      <span class="field-label">auto listen</span>
+      <input type="checkbox" :checked="settings.autoListen" @change="emit('update', 'autoListen', $event.target.checked)" />
+      <span class="field-hint">start listening when the app opens</span>
     </label>
 
     <label class="field">
@@ -88,7 +100,7 @@ onUnmounted(() => navigator.mediaDevices.removeEventListener('devicechange', loa
       </div>
     </div>
 
-    <div class="field-hint">Mic and system audio apply to the next recording.</div>
+    <div class="field-hint">Audio changes restart listening right away.</div>
   </div>
 </template>
 

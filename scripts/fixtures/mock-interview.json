@@ -1,0 +1,16 @@
+{
+  "description": "Mock interviewer turns. Each turn is one or more clips joined by pauses (pauses inside a question test that the whole question is kept). answerSeconds is the silence while the candidate answers. sendDelayMs is how long after the interviewer stops the send is pressed (100 = pressed almost at once, before VAD commits).",
+  "answerSeconds": 4,
+  "turns": [
+    { "voice": "nova", "clips": ["Hi Satish, can you hear me okay?"], "sendDelayMs": 700 },
+    { "voice": "nova", "clips": ["Great. So to start, tell me a little bit about yourself and, uh,", "what you've been working on recently."], "pausesMs": [900], "sendDelayMs": 800 },
+    { "voice": "onyx", "accent": "Indian English", "clips": ["You mentioned Vue. Can you explain the difference between computed properties and watchers in Vue.js?"], "sendDelayMs": 600 },
+    { "voice": "onyx", "accent": "Indian English", "clips": ["Okay, and what about performance? When would a watcher be the wrong choice?"], "sendDelayMs": 100 },
+    { "voice": "echo", "accent": "British English", "clips": ["Let's say you have a dashboard that loads", "thousands of rows from a REST API. How would you make it fast, and how would you test it?"], "pausesMs": [1000], "sendDelayMs": 700 },
+    { "voice": "echo", "accent": "British English", "clips": ["Hmm, are you sure virtual scrolling alone solves that? What about the API side?"], "sendDelayMs": 500 },
+    { "voice": "shimmer", "pace": "fast", "clips": ["Going back to that RAG project on your resume, why did you choose LangChain for it?"], "sendDelayMs": 700 },
+    { "voice": "shimmer", "pace": "fast", "clips": ["Sorry, let me rephrase. I mean, why LangChain instead of calling the OpenAI API directly?"], "sendDelayMs": 300 },
+    { "voice": "alloy", "clips": ["Tell me about a time you disagreed with a teammate on a technical decision,", "and how you resolved it."], "pausesMs": [700], "sendDelayMs": 900 },
+    { "voice": "alloy", "clips": ["Last one. Write a function that debounces another function in JavaScript."], "sendDelayMs": 600 }
+  ]
+}

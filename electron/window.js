@@ -15,8 +15,8 @@ const SHORTCUTS = {
   toggleClickThrough: 'CommandOrControl+Shift+X',
   opacityUp: 'CommandOrControl+Shift+Up',
   opacityDown: 'CommandOrControl+Shift+Down',
-  toggleRecord: 'CommandOrControl+Shift+Space',
-  answer: 'CommandOrControl+Shift+Enter',
+  toggleListen: 'CommandOrControl+Shift+Space', // pause / resume listening
+  answer: 'CommandOrControl+Shift+Enter', // answer everything heard since the last answer
   analyzeScreen: 'CommandOrControl+Shift+S'
 };
 
@@ -88,7 +88,7 @@ function registerShortcuts() {
     [SHORTCUTS.toggleClickThrough, toggleClickThrough],
     [SHORTCUTS.opacityUp, () => adjustOpacity(OPACITY_STEP)],
     [SHORTCUTS.opacityDown, () => adjustOpacity(-OPACITY_STEP)],
-    [SHORTCUTS.toggleRecord, () => emitToRenderer('shortcut:toggle-record')],
+    [SHORTCUTS.toggleListen, () => emitToRenderer('shortcut:toggle-listen')],
     [SHORTCUTS.answer, () => emitToRenderer('shortcut:answer')],
     [SHORTCUTS.analyzeScreen, () => emitToRenderer('shortcut:screen')]
   ];

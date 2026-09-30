@@ -33,13 +33,14 @@ contextBridge.exposeInMainWorld('overlayApi', {
   transcribeAudio: (payload) => ipcRenderer.invoke('whisper:transcribe', payload),
   startRealtimeSession: (payload) => ipcRenderer.invoke('realtime:start', payload),
   sendRealtimeAudioChunk: (pcm) => ipcRenderer.send('realtime:audio-chunk', pcm),
-  stopRealtimeSession: () => ipcRenderer.invoke('realtime:stop'),
-  onRealtimeTranscriptDelta: (callback) => subscribe('realtime:transcript-delta', callback),
-  onRealtimeTranscriptDone: (callback) => subscribe('realtime:transcript-done', callback),
+  takeQuestionBlock: () => ipcRenderer.invoke('realtime:take-block'),
+  resetQuestionBlock: () => ipcRenderer.invoke('realtime:reset-block'),
+  onRealtimePending: (callback) => subscribe('realtime:pending', callback),
+  onRealtimeStatus: (callback) => subscribe('realtime:status', callback),
   onRealtimeError: (callback) => subscribe('realtime:error', callback),
 
   // Global hotkeys
-  onShortcutToggleRecord: (callback) => subscribe('shortcut:toggle-record', callback),
+  onShortcutToggleListen: (callback) => subscribe('shortcut:toggle-listen', callback),
   onShortcutAnswer: (callback) => subscribe('shortcut:answer', callback),
   onShortcutScreen: (callback) => subscribe('shortcut:screen', callback)
 });
