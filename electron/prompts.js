@@ -43,6 +43,7 @@ function createTextRequestBody({ model, context, style = 'brief', history = [], 
   return {
     model,
     stream: true,
+    stream_options: { include_usage: true },
     temperature: 0.4,
     max_tokens: MAX_TOKENS[style] || MAX_TOKENS.brief,
     messages: [
@@ -57,6 +58,7 @@ function createVisionRequestBody({ model, context, style = 'brief', history = []
   return {
     model,
     stream: true,
+    stream_options: { include_usage: true },
     temperature: 0.4,
     max_tokens: 1200,
     messages: [

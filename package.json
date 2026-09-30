@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "test": "vitest run",
+    "report": "node scripts/latency-report.js",
     "start": "electron .",
     "start:dev": "set VITE_DEV_SERVER_URL=http://localhost:5173&& electron .",
     "pack": "electron-builder --dir",

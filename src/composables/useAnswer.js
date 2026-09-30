@@ -20,6 +20,7 @@ export function useAnswer() {
   let timer = null
   let pendingText = ''
   let renderFrame = null
+  let trace = null // timestamps for the current answer, written to traces.jsonl when it ends
 
   function stopTimer() {
     clearInterval(timer)
@@ -38,6 +39,7 @@ export function useAnswer() {
     renderFrame = requestAnimationFrame(() => {
       renderFrame = null
       text.value = pendingText
+      if (trace && !trace.firstRenderAt) trace.firstRenderAt = Date.now()
     })
   }
 
@@ -48,8 +50,9 @@ export function useAnswer() {
     stopTimer()
   }
 
-  // Opens the panel and starts the clock (before transcription, if any).
-  function begin(displayQuestion) {
+  // Opens the panel and starts the clock at `pressedAt` (the hotkey press, so
+  // transcription wait counts too). `kind` labels the trace: audio/paste/screen/follow-up.
+  function begin(displayQuestion, { pressedAt = Date.now(), kind = 'text' } = {}) {
     finish()
     visible.value = true
     question.value = displayQuestion
@@ -58,7 +61,8 @@ export function useAnswer() {
     error.value = ''
     latency.value = null
     elapsed.value = 0
-    startTime = Date.now()
+    startTime = pressedAt
+    trace = { kind, pressedAt }
     timer = setInterval(() => { elapsed.value = Math.round((Date.now() - startTime) / 1000) }, 500)
   }
 
@@ -66,6 +70,7 @@ export function useAnswer() {
     requestId = `req_${Date.now()}`
     historyQuestion = questionForHistory
     streaming.value = true
+    if (trace) Object.assign(trace, { blockReadyAt: Date.now(), blockChars: payload.question?.length ?? 0 })
     window.overlayApi.runOpenAiRequest({
       requestId,
       apiKey,
@@ -101,11 +106,23 @@ export function useAnswer() {
     history.value = []
   }
 
-  function onDone({ requestId: id, text: finalText }) {
+  function writeTrace(ok, timing, message) {
+    if (!trace) return
+    window.overlayApi.writeTrace({ ...trace, ok, error: message, timing })
+    trace = null
+  }
+
+  function onDone({ requestId: id, text: finalText, timing }) {
     if (id !== requestId) return
     finish()
     text.value = finalText || pendingText
-    latency.value = ((Date.now() - startTime) / 1000).toFixed(1) + 's'
+    const doneAt = Date.now()
+    if (trace && !trace.firstRenderAt && text.value) trace.firstRenderAt = doneAt
+    const seconds = (at) => ((at - startTime) / 1000).toFixed(1) + 's'
+    latency.value = trace?.firstRenderAt
+      ? `first words ${seconds(trace.firstRenderAt)} · done ${seconds(doneAt)}`
+      : seconds(doneAt)
+    writeTrace(!!text.value, timing, text.value ? undefined : 'empty response')
     if (!text.value) {
       error.value = 'No response received — check your API key or try again.'
       return
@@ -117,8 +134,9 @@ export function useAnswer() {
     ].slice(-HISTORY_MESSAGES)
   }
 
-  function onError({ requestId: id, message }) {
+  function onError({ requestId: id, message, timing }) {
     if (id !== requestId) return
+    writeTrace(false, timing, message || 'Request failed.')
     fail(message || 'Request failed.')
   }
 

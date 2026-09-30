@@ -1,6 +1,6 @@
 'use strict';
 
-const { splitSseEvents, parseChatDelta } = require('./sse');
+const { splitSseEvents, parseChatChunk } = require('./sse');
 const { describeHttpError, describeNetworkError } = require('./errors');
 
 const API_BASE = 'https://api.openai.com/v1';
@@ -36,7 +36,7 @@ async function fetchWithRetry(url, options, onAttempt) {
   }
 }
 
-async function readChatStream(response, onDelta, onChunk) {
+async function readChatStream(response, onDelta, onChunk, timing) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -52,8 +52,10 @@ async function readChatStream(response, onDelta, onChunk) {
 
     for (const payload of payloads) {
       if (payload === '[DONE]') return text;
-      const delta = parseChatDelta(payload);
+      const { text: delta, usage } = parseChatChunk(payload);
+      if (usage) timing.usage = usage;
       if (!delta) continue;
+      timing.firstTokenAt ??= Date.now();
       text += delta;
       onDelta(text);
     }
@@ -62,7 +64,9 @@ async function readChatStream(response, onDelta, onChunk) {
 
 // Streams a chat completion, calling onDelta(fullTextSoFar) as tokens arrive.
 // Aborting `controller` cancels it; stalls are turned into readable errors.
-async function streamChatCompletion({ apiKey, body, controller, onDelta }) {
+// `timing` is filled in as the request progresses: requestSentAt, attempts,
+// firstTokenAt and usage.
+async function streamChatCompletion({ apiKey, body, controller, onDelta, timing = {} }) {
   // One timer, re-armed as the request progresses: first waiting for headers,
   // then waiting between stream chunks. Whichever fires records why.
   let timeoutReason = null;
@@ -78,7 +82,11 @@ async function streamChatCompletion({ apiKey, body, controller, onDelta }) {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
       signal: controller.signal
-    }, () => armTimer(HEADERS_TIMEOUT_MS, 'headers'));
+    }, () => {
+      timing.requestSentAt ??= Date.now();
+      timing.attempts = (timing.attempts || 0) + 1;
+      armTimer(HEADERS_TIMEOUT_MS, 'headers');
+    });
 
     if (!response.ok) {
       const body = await response.text();
@@ -88,7 +96,7 @@ async function streamChatCompletion({ apiKey, body, controller, onDelta }) {
 
     const rearmIdle = () => armTimer(STREAM_IDLE_TIMEOUT_MS, 'idle');
     rearmIdle();
-    return await readChatStream(response, onDelta, rearmIdle);
+    return await readChatStream(response, onDelta, rearmIdle, timing);
   } catch (error) {
     if (error.name === 'AbortError' && timeoutReason === 'headers') {
       throw new Error(`No response from OpenAI after ${HEADERS_TIMEOUT_MS / 1000}s. Check your network and try again.`);

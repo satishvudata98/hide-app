@@ -19,14 +19,16 @@ function splitSseEvents(buffer) {
   return { payloads, rest };
 }
 
-// Text delta from one chat-completions stream payload ('' if none or unparseable).
-function parseChatDelta(payload) {
+// Text delta and (on the final chunk, with include_usage) token usage from
+// one chat-completions stream payload. Unparseable payloads give { text: '' }.
+function parseChatChunk(payload) {
   try {
-    const content = JSON.parse(payload)?.choices?.[0]?.delta?.content;
-    return typeof content === 'string' ? content : '';
+    const chunk = JSON.parse(payload);
+    const content = chunk?.choices?.[0]?.delta?.content;
+    return { text: typeof content === 'string' ? content : '', usage: chunk?.usage || null };
   } catch {
-    return '';
+    return { text: '', usage: null };
   }
 }
 
-module.exports = { splitSseEvents, parseChatDelta };
+module.exports = { splitSseEvents, parseChatChunk };

@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('overlayApi', {
   onOpenAiDelta: (callback) => subscribe('openai:delta', callback),
   onOpenAiDone: (callback) => subscribe('openai:done', callback),
   onOpenAiError: (callback) => subscribe('openai:error', callback),
+  writeTrace: (record) => ipcRenderer.send('trace:write', record),
 
   // Transcription
   transcribeAudio: (payload) => ipcRenderer.invoke('whisper:transcribe', payload),

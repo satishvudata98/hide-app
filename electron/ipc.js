@@ -1,5 +1,6 @@
 'use strict';
 
+const path = require('node:path');
 const { app, ipcMain } = require('electron');
 const { readSettings, writeSettings } = require('./settings');
 const { getContext, getContextStatus } = require('./context');
@@ -7,6 +8,7 @@ const { createTextRequestBody, createVisionRequestBody } = require('./prompts');
 const { streamChatCompletion, transcribeWithWhisper } = require('./openai');
 const { captureScreen } = require('./capture');
 const { resizeHeight } = require('./window');
+const { buildTraceRecord, appendTrace } = require('./trace');
 
 const DEFAULT_ANSWER_MODEL = 'gpt-4o'; // override with "answerModel" in the settings file
 
@@ -35,6 +37,7 @@ async function runAnswerRequest(sender, payload) {
 
   const body = buildAnswerRequestBody(payload);
   const controller = new AbortController();
+  const timing = { model: body.model };
   activeRequests.set(requestId, controller);
   console.log(`[openai] ${requestId} started (${body.model})`);
 
@@ -43,13 +46,22 @@ async function runAnswerRequest(sender, payload) {
       apiKey,
       body,
       controller,
+      timing,
       onDelta: (textSoFar) => sender.send('openai:delta', { requestId, text: textSoFar })
     });
+    timing.doneAt = Date.now();
     console.log(`[openai] ${requestId} done: ${text.length} chars`);
-    sender.send('openai:done', { requestId, text });
+    sender.send('openai:done', { requestId, text, timing });
+  } catch (error) {
+    error.timing = timing;
+    throw error;
   } finally {
     activeRequests.delete(requestId);
   }
+}
+
+function getTracePath() {
+  return path.join(app.getPath('userData'), 'traces.jsonl');
 }
 
 function registerIpcHandlers(realtime) {
@@ -60,12 +72,13 @@ function registerIpcHandlers(realtime) {
   ipcMain.handle('settings:get', (_event, key) => readSettings()[key] ?? null);
   ipcMain.handle('settings:set', (_event, key, value) => writeSettings({ [key]: value }));
   ipcMain.handle('context:status', () => getContextStatus());
+  ipcMain.on('trace:write', (_event, raw) => appendTrace(getTracePath(), buildTraceRecord(raw)));
 
   ipcMain.on('openai:run', (event, payload) => {
     runAnswerRequest(event.sender, payload).catch((error) => {
       if (error.name === 'AbortError') return; // cancelled by the user
       console.error('[openai] error:', error.message);
-      event.sender.send('openai:error', { requestId: payload.requestId, message: error.message });
+      event.sender.send('openai:error', { requestId: payload.requestId, message: error.message, timing: error.timing });
     });
   });
 

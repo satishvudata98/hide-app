@@ -122,6 +122,8 @@ async function finalizeRecording() {
 // ── Answering ──
 async function answerQuestion() {
   if (!canAnswer.value || !requireApiKey()) return
+  const pressedAt = Date.now()
+  const kind = isRecording.value ? 'audio' : 'paste'
 
   let wav = null
   if (isRecording.value) {
@@ -137,7 +139,7 @@ async function answerQuestion() {
     return
   }
 
-  answer.begin(question)
+  answer.begin(question, { pressedAt, kind })
 
   if (!question) {
     phase.value = 'transcribing'
@@ -158,6 +160,7 @@ async function answerQuestion() {
 
 async function analyzeScreen() {
   if (isBusy.value || isRecording.value || !requireApiKey()) return
+  const pressedAt = Date.now()
 
   showPastePanel.value = false
   phase.value = 'capturing'
@@ -171,14 +174,14 @@ async function analyzeScreen() {
     return
   }
 
-  answer.begin('Screen analysis')
+  answer.begin('Screen analysis', { pressedAt, kind: 'screen' })
   answer.send(apiKey.value, { imageBase64: result.imageBase64, imageType: result.imageType }, SCREEN_HISTORY_QUESTION)
 }
 
 function followUp(kind) {
   if (!canFollowUp.value || !requireApiKey()) return
   const instruction = FOLLOW_UP_INSTRUCTIONS[kind]
-  answer.begin(`↳ ${kind}`)
+  answer.begin(`↳ ${kind}`, { kind: 'follow-up' })
   answer.send(apiKey.value, { question: instruction, isFollowUp: true }, instruction)
 }
 
