@@ -1,18 +1,30 @@
 <script setup>
-defineProps({
+import { computed } from 'vue'
+
+const props = defineProps({
   canAnswer: Boolean,
   canAnalyze: Boolean,
   canPaste: Boolean,
   pasteOpen: Boolean,
-  isRecording: Boolean,
-  recordingSeconds: { type: Number, default: 0 },
-  level: { type: Number, default: 0 }, // input loudness 0..1 while recording
+  listen: { type: String, default: 'off' }, // 'off' | 'starting' | 'on' | 'paused'
+  connection: { type: String, default: 'offline' }, // live transcript socket state
+  level: { type: Number, default: 0 }, // input loudness 0..1 while listening
+  hasPending: Boolean, // heard text waiting for the next answer
   hasHistory: Boolean,
   settingsOpen: Boolean,
   clickThrough: Boolean
 })
 
-defineEmits(['answer', 'analyze', 'toggle-paste', 'toggle-settings', 'clear-audio', 'clear-session', 'rec', 'quit'])
+defineEmits(['answer', 'analyze', 'toggle-paste', 'toggle-settings', 'reset-block', 'clear-session', 'toggle-listen', 'quit'])
+
+const isOn = computed(() => props.listen === 'on')
+const isDegraded = computed(() => isOn.value && props.connection !== 'connected')
+const listenLabel = computed(() => {
+  if (props.listen === 'starting') return '…'
+  if (props.listen === 'paused') return 'paused'
+  if (!isOn.value) return 'listen'
+  return isDegraded.value ? props.connection : 'live'
+})
 </script>
 
 <template>
@@ -37,12 +49,17 @@ defineEmits(['answer', 'analyze', 'toggle-paste', 'toggle-settings', 'clear-audi
 
     <div class="right-actions">
       <span class="badge" v-if="clickThrough" title="Ctrl+Shift+X to turn off">click-through</span>
-      <button class="icon-btn" v-if="isRecording" @click="$emit('clear-audio')" title="Clear recorded audio">↺</button>
+      <button class="icon-btn" v-if="hasPending" @click="$emit('reset-block')" title="Discard what was heard so far">↺</button>
       <button class="icon-btn clear-btn" v-if="hasHistory" @click="$emit('clear-session')" title="Clear session history">⊘</button>
-      <div class="rec-pill" :class="isRecording ? 'active' : 'inactive'" @click="$emit('rec')">
-        <span class="rec-dot" :class="{ pulsing: isRecording }"></span>
-        <span class="rec-label">{{ isRecording ? recordingSeconds + 's' : 'rec' }}</span>
-        <span class="level-meter" v-if="isRecording" title="Input level">
+      <div
+        class="rec-pill"
+        :class="[isOn ? 'active' : 'inactive', { degraded: isDegraded }]"
+        @click="$emit('toggle-listen')"
+        title="Ctrl+Shift+Space: pause / resume listening"
+      >
+        <span class="rec-dot" :class="{ pulsing: isOn && !isDegraded }"></span>
+        <span class="rec-label">{{ listenLabel }}</span>
+        <span class="level-meter" v-if="isOn" title="Input level">
           <span class="level-fill" :style="{ width: Math.round(level * 100) + '%' }"></span>
         </span>
       </div>
@@ -148,6 +165,21 @@ defineEmits(['answer', 'analyze', 'toggle-paste', 'toggle-settings', 'clear-audi
 
 .rec-pill.active .rec-label {
   color: var(--red);
+}
+
+/* Listening, but the live transcript is (re)connecting */
+.rec-pill.degraded {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+
+.rec-pill.degraded .rec-dot {
+  background: rgb(251, 191, 36);
+  opacity: 1;
+}
+
+.rec-pill.degraded .rec-label {
+  color: rgb(251, 191, 36);
 }
 
 .rec-dot {

@@ -5,23 +5,27 @@ import { encodeWav, mergePcmFrames } from '../lib/wav'
 export const PCM_SAMPLE_RATE = 24000 // realtime API input rate; also used for the fallback WAV
 const MAX_FALLBACK_FRAMES = 120 * 10 // ~2 minutes of 100ms worklet frames
 
-// System audio (loopback, works with earphones) and the mic, opened in
-// parallel. Either one alone is enough. An unavailable saved mic falls back
-// to the default one (deviceId is a preference, not a requirement).
-async function openAudioStreams({ micDeviceId = '', systemAudio = true }) {
+// System audio (loopback: what the interviewer says, even through earphones)
+// and optionally the mic, opened in parallel. An unavailable saved mic falls
+// back to the default one (deviceId is a preference, not a requirement).
+async function openAudioStreams({ micDeviceId = '', systemAudio = true, includeMic = false }) {
+  if (!systemAudio && !includeMic) throw new Error('System audio and mic are both turned off in settings')
+
   const [system, mic] = await Promise.allSettled([
     systemAudio
       ? navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
       : Promise.reject(new Error('system audio turned off in settings')),
-    navigator.mediaDevices.getUserMedia({
-      audio: {
-        deviceId: micDeviceId || undefined,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      },
-      video: false
-    })
+    includeMic
+      ? navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: micDeviceId || undefined,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        },
+        video: false
+      })
+      : Promise.reject(new Error('mic turned off in settings'))
   ])
 
   const streams = []
@@ -29,32 +33,35 @@ async function openAudioStreams({ micDeviceId = '', systemAudio = true }) {
     // Only the loopback audio is needed; drop the screen video track
     system.value.getVideoTracks().forEach((track) => track.stop())
     if (system.value.getAudioTracks().length) streams.push(system.value)
-  } else {
+  } else if (systemAudio) {
     console.warn('[audio] system audio unavailable:', system.reason?.message)
   }
   if (mic.status === 'fulfilled') streams.push(mic.value)
-  else console.warn('[audio] mic unavailable:', mic.reason?.message)
+  else if (includeMic) console.warn('[audio] mic unavailable:', mic.reason?.message)
 
-  if (!streams.length) throw mic.reason || system.reason || new Error('No audio source available')
+  if (!streams.length) throw system.reason || mic.reason || new Error('No audio source available')
   return streams
 }
 
-// Captures audio as mono 24kHz PCM16 frames of 100ms. Each frame is passed to
-// onFrame(ArrayBuffer); the last ~2 minutes are kept for a Whisper fallback.
-// `level` (0..1) follows the input loudness so a silent mic is obvious.
+// Always-on capture as mono 24kHz PCM16 frames of 100ms. Each frame is passed
+// to onFrame(ArrayBuffer). The last ~2 minutes are kept so the audio since the
+// last send can go to Whisper when the live transcript is unavailable.
+// `level` (0..1) follows the input loudness. onInterrupted() is called if a
+// source ends by itself (device unplugged, display change).
 export function useRecorder() {
-  const seconds = ref(0)
   const level = ref(0)
   let streams = []
   let audioContext = null
   let workletNode = null
-  let timer = null
   let frames = []
+  let frameCount = 0 // frames received since start; frames[] holds the newest of them
+  let sentAt = 0 // frameCount at the last send
 
-  async function start(onFrame, options = {}) {
+  async function start(onFrame, { onInterrupted, ...options } = {}) {
+    stop()
     frames = []
-    seconds.value = 0
-    level.value = 0
+    frameCount = 0
+    sentAt = 0
     try {
       streams = await openAudioStreams(options)
       // The context runs at the target rate; Chromium resamples the inputs
@@ -63,15 +70,18 @@ export function useRecorder() {
       workletNode = new AudioWorkletNode(audioContext, 'pcm-capture', { numberOfOutputs: 0 })
       // All sources feed the same worklet input, which mixes them into one mono stream
       for (const stream of streams) audioContext.createMediaStreamSource(stream).connect(workletNode)
+      for (const track of streams.flatMap((stream) => stream.getAudioTracks())) {
+        track.addEventListener('ended', () => onInterrupted?.(), { once: true })
+      }
 
       workletNode.port.onmessage = ({ data }) => {
         frames.push(new Int16Array(data.pcm))
+        frameCount++
         if (frames.length > MAX_FALLBACK_FRAMES) frames.shift()
         // Speech RMS is roughly 0.02–0.3; sqrt spreads that across the meter. Fall back slowly.
         level.value = Math.max(Math.min(1, Math.sqrt(data.level) * 1.6), level.value * 0.6)
         onFrame(data.pcm)
       }
-      timer = setInterval(() => seconds.value++, 1000)
     } catch (error) {
       stop()
       throw error
@@ -79,8 +89,6 @@ export function useRecorder() {
   }
 
   function stop() {
-    clearInterval(timer)
-    timer = null
     level.value = 0
     streams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()))
     streams = []
@@ -93,13 +101,15 @@ export function useRecorder() {
     audioContext = null
   }
 
-  function clearBuffer() {
-    frames = []
+  // Marks a send. Returns a function that encodes the audio since the previous
+  // send (at most the retained ~2 minutes) as a WAV, or null when there is none.
+  // Encoding is deferred because it's only needed when Whisper is the fallback.
+  function takeSinceLastSend() {
+    const count = Math.min(frameCount - sentAt, frames.length)
+    sentAt = frameCount
+    const since = count > 0 ? frames.slice(-count) : []
+    return () => (since.length ? encodeWav(mergePcmFrames(since), PCM_SAMPLE_RATE) : null)
   }
 
-  function takeFallbackWav() {
-    return frames.length ? encodeWav(mergePcmFrames(frames), PCM_SAMPLE_RATE) : null
-  }
-
-  return { seconds, level, start, stop, clearBuffer, takeFallbackWav }
+  return { level, start, stop, takeSinceLastSend }
 }

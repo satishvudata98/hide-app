@@ -8,11 +8,10 @@ import { useRecorder } from '../composables/useRecorder'
 import { useAnswer } from '../composables/useAnswer'
 
 const api = window.overlayApi
-const SCREEN_HISTORY_QUESTION = '[Screenshot: question shown on screen]'
 const FOLLOW_UP_INSTRUCTIONS = {
   shorter: 'Make that answer shorter: one or two sentences I can say right away.',
-  'with code': 'Add a short, working code example to that answer.',
-  simpler: 'Explain that answer more simply, in plain words.'
+  deeper: 'Go one level deeper on that answer: more technical detail and the trade-offs, still easy to say out loud.',
+  'with code': 'Add a short, working code example to that answer.'
 }
 
 // ── API key ──
@@ -22,26 +21,37 @@ const apiKeyInput = ref('')
 const showKeyInput = ref(false)
 
 // ── State ──
-// phase covers everything before the answer streams; the stream itself is answer.streaming
-const phase = ref('idle') // 'idle' | 'recording' | 'finalizing' | 'transcribing' | 'capturing'
-const transcriptText = ref('') // the question to answer (realtime transcript or pasted text)
-const liveTranscript = ref('')
+// listen: the always-on capture. phase: everything before an answer streams;
+// the stream itself is answer.streaming.
+const listen = ref('off') // 'off' | 'starting' | 'on' | 'paused'
+const connection = ref('offline') // live transcript socket: 'connecting' | 'connected' | 'reconnecting' | 'offline'
+const phase = ref('idle') // 'idle' | 'finalizing' | 'transcribing' | 'capturing'
+const pendingText = ref('') // heard since the last answer: what the next send answers
+const speaking = ref(false) // the interviewer is mid-sentence
 const statusMsg = ref('')
 const showPastePanel = ref(false)
 const showSettings = ref(false)
 const clickThrough = ref(false)
 
-// Persisted in the settings file; answerModel/answerStyle are read by main per request
-const settings = reactive({ micDeviceId: '', systemAudio: true, answerModel: '', answerStyle: 'brief' })
+// Persisted in the settings file; answerModel/answerStyle/vadSilenceMs are read by main
+const settings = reactive({
+  micDeviceId: '',
+  systemAudio: true,
+  includeMic: false,
+  autoListen: true,
+  vadSilenceMs: 300,
+  answerModel: '',
+  answerStyle: 'brief'
+})
+const AUDIO_SETTINGS = ['micDeviceId', 'systemAudio', 'includeMic']
+const SEND_DEBOUNCE_MS = 300
 
 const recorder = useRecorder()
 const answer = useAnswer()
 
-const isRecording = computed(() => phase.value === 'recording')
-const isBusy = computed(() => ['finalizing', 'transcribing', 'capturing'].includes(phase.value) || answer.streaming.value)
-const canAnswer = computed(() => !isBusy.value && (isRecording.value || !!transcriptText.value.trim()))
+const isBusy = computed(() => phase.value !== 'idle' || answer.streaming.value)
 const canFollowUp = computed(() =>
-  !isBusy.value && !isRecording.value && !!answer.latency.value && !!answer.text.value && answer.history.value.length > 0
+  !isBusy.value && !!answer.latency.value && !!answer.text.value && answer.exchangeCount.value > 0
 )
 const loadingLabel = computed(() => {
   if (phase.value === 'transcribing') return 'transcribing audio'
@@ -50,7 +60,7 @@ const loadingLabel = computed(() => {
 
 function flashStatus(message) {
   statusMsg.value = message
-  setTimeout(() => { if (statusMsg.value === message) statusMsg.value = '' }, 2000)
+  setTimeout(() => { if (statusMsg.value === message) statusMsg.value = '' }, 2500)
 }
 
 function requireApiKey() {
@@ -60,104 +70,116 @@ function requireApiKey() {
   return false
 }
 
-// ── Recording ──
-async function startRecording() {
-  if (phase.value !== 'idle' || isBusy.value || !requireApiKey()) return
+// ── Listening ──
+// Capture runs all the time; main keeps the transcript and queues audio
+// until the socket is open.
+async function startListening() {
+  if (listen.value === 'on' || listen.value === 'starting' || !requireApiKey()) return
+  listen.value = 'starting'
 
-  showPastePanel.value = false
-  transcriptText.value = ''
-  liveTranscript.value = ''
-  statusMsg.value = ''
-  answer.close()
-
-  // Start (or reset) the realtime session before audio flows; main queues
-  // audio until the socket is open.
   api.startRealtimeSession({ apiKey: apiKey.value }).catch((err) => {
-    console.warn('[realtime] session start failed, will fall back to Whisper:', err.message)
+    console.warn('[realtime] session start failed, sends will fall back to Whisper:', err.message)
   })
 
   try {
     await recorder.start((pcm) => api.sendRealtimeAudioChunk(pcm), {
       micDeviceId: settings.micDeviceId,
-      systemAudio: settings.systemAudio
+      systemAudio: settings.systemAudio,
+      includeMic: settings.includeMic,
+      onInterrupted: () => restartListening('An audio source stopped. Restarting capture…')
     })
-    phase.value = 'recording'
+    listen.value = 'on'
   } catch (err) {
+    listen.value = 'off'
     statusMsg.value = 'Audio capture failed: ' + err.message
   }
 }
 
-function discardRecording() {
+function pauseListening() {
   recorder.stop()
-  liveTranscript.value = ''
-  if (isRecording.value) phase.value = 'idle'
+  listen.value = 'paused'
 }
 
-function clearAudio() {
-  recorder.clearBuffer()
-  transcriptText.value = ''
-  liveTranscript.value = ''
-  api.startRealtimeSession({ apiKey: apiKey.value }).catch(() => {}) // clears the server buffer
-  flashStatus('Cleared.')
+function toggleListening() {
+  if (listen.value === 'on') pauseListening()
+  else startListening()
 }
 
-// Stops capture and returns the realtime transcript, or a WAV of the retained
-// audio when realtime produced nothing.
-async function finalizeRecording() {
+function restartListening(message) {
+  if (listen.value !== 'on') return
+  if (message) flashStatus(message)
   recorder.stop()
-  liveTranscript.value = ''
-  phase.value = 'finalizing'
-  statusMsg.value = 'Finalizing transcript...'
+  listen.value = 'off'
+  setTimeout(startListening, 500)
+}
 
-  let transcript = ''
-  try {
-    transcript = (await api.stopRealtimeSession())?.transcript?.trim() || ''
-  } catch (err) {
-    console.warn('[realtime] transcript unavailable, falling back to Whisper:', err.message)
-  }
-  statusMsg.value = ''
-  return transcript ? { transcript, wav: null } : { transcript: '', wav: recorder.takeFallbackWav() }
+// Throws away what was heard so far (small talk before the first question…)
+function resetBlock() {
+  recorder.takeSinceLastSend()
+  api.resetQuestionBlock()
+  flashStatus('Cleared. Listening for the next question.')
 }
 
 // ── Answering ──
+// Sends everything heard since the last answer. Listening never stops. When
+// the live transcript is unavailable, the audio since the last send goes to
+// Whisper instead. Sending while an answer streams replaces it (the
+// interviewer moved on); a block with nothing new leaves it alone.
+let lastSendAt = 0
 async function answerQuestion() {
-  if (!canAnswer.value || !requireApiKey()) return
+  if (phase.value !== 'idle' || !requireApiKey()) return
+  const pressedAt = Date.now()
+  if (pressedAt - lastSendAt < SEND_DEBOUNCE_MS) return // double press
+  lastSendAt = pressedAt
+  showPastePanel.value = false
 
-  let wav = null
-  if (isRecording.value) {
-    const result = await finalizeRecording()
-    if (result.transcript) transcriptText.value = result.transcript
-    wav = result.wav
-    phase.value = 'idle'
+  phase.value = 'finalizing'
+  const takeWav = recorder.takeSinceLastSend()
+  let block
+  try {
+    block = await api.takeQuestionBlock()
+  } catch (err) {
+    console.warn('[realtime] block unavailable, falling back to Whisper:', err.message)
+    block = { text: '', degraded: true }
   }
+  let question = block.text?.trim() || ''
+  const wav = block.degraded ? takeWav() : null
 
-  let question = transcriptText.value.trim()
-  if (!question && !wav) {
-    statusMsg.value = 'No transcript or audio to analyze.'
+  if (!wav) {
+    phase.value = 'idle'
+    if (question) {
+      answer.begin(question, { pressedAt, kind: 'audio' })
+      answer.send(apiKey.value, { question, turnKind: 'interviewer' })
+    } else {
+      flashStatus(listen.value === 'on' ? 'Nothing new heard since the last answer.' : 'Not listening. Press Ctrl+Shift+Space.')
+    }
     return
   }
 
-  answer.begin(question)
-
+  phase.value = 'transcribing'
+  answer.begin('', { pressedAt, kind: 'whisper' })
+  const result = await api.transcribeAudio({ apiKey: apiKey.value, wav })
+  if (phase.value !== 'transcribing') return // stopped or closed meanwhile
+  phase.value = 'idle'
+  question = result.text?.trim() || question
   if (!question) {
-    phase.value = 'transcribing'
-    const result = await api.transcribeAudio({ apiKey: apiKey.value, wav })
-    if (phase.value !== 'transcribing') return // stopped or closed meanwhile
-    phase.value = 'idle'
-    question = result.text?.trim() || ''
-    if (!question) {
-      answer.fail(result.error ? 'Transcription failed: ' + result.error : 'No speech detected. Try again.')
-      return
-    }
-    transcriptText.value = question
-    answer.question.value = question
+    answer.fail(result.error ? 'Transcription failed: ' + result.error : 'No speech detected. Try again.')
+    return
   }
+  answer.question.value = question
+  answer.send(apiKey.value, { question, turnKind: 'interviewer' })
+}
 
-  answer.send(apiKey.value, { question }, question)
+function answerPastedText(text) {
+  if (phase.value !== 'idle' || !requireApiKey()) return
+  showPastePanel.value = false
+  answer.begin(text, { kind: 'paste' })
+  answer.send(apiKey.value, { question: text, turnKind: 'pasted' })
 }
 
 async function analyzeScreen() {
-  if (isBusy.value || isRecording.value || !requireApiKey()) return
+  if (isBusy.value || !requireApiKey()) return
+  const pressedAt = Date.now()
 
   showPastePanel.value = false
   phase.value = 'capturing'
@@ -171,15 +193,20 @@ async function analyzeScreen() {
     return
   }
 
-  answer.begin('Screen analysis')
-  answer.send(apiKey.value, { imageBase64: result.imageBase64, imageType: result.imageType }, SCREEN_HISTORY_QUESTION)
+  answer.begin('Screen analysis', { pressedAt, kind: 'screen' })
+  answer.send(apiKey.value, { imageBase64: result.imageBase64, imageType: result.imageType })
 }
 
 function followUp(kind) {
   if (!canFollowUp.value || !requireApiKey()) return
   const instruction = FOLLOW_UP_INSTRUCTIONS[kind]
-  answer.begin(`↳ ${kind}`)
-  answer.send(apiKey.value, { question: instruction, isFollowUp: true }, instruction)
+  answer.begin(`↳ ${kind}`, { kind: 'follow-up' })
+  answer.send(apiKey.value, { question: instruction, turnKind: 'request' })
+}
+
+function regenerate() {
+  if (phase.value !== 'idle' || !requireApiKey()) return
+  if (!answer.regenerate(apiKey.value)) flashStatus('Nothing to regenerate yet.')
 }
 
 function stopAnswer() {
@@ -190,12 +217,6 @@ function stopAnswer() {
 function closeAnswer() {
   stopAnswer()
   answer.close()
-}
-
-function submitPasteText(text) {
-  transcriptText.value = text
-  showPastePanel.value = false
-  answerQuestion()
 }
 
 // Paste and settings share the space under the bar; only one is open at a time
@@ -220,9 +241,16 @@ async function loadSettings() {
   }
 }
 
-function updateSetting(key, value) {
+async function updateSetting(key, value) {
   settings[key] = value
-  api.setSettings(key, value).catch((err) => { statusMsg.value = 'Could not save settings: ' + err.message })
+  try {
+    await api.setSettings(key, value)
+  } catch (err) {
+    statusMsg.value = 'Could not save settings: ' + err.message
+    return
+  }
+  if (AUDIO_SETTINGS.includes(key)) restartListening()
+  if (key === 'vadSilenceMs' && listen.value === 'on') api.startRealtimeSession({ apiKey: apiKey.value }).catch(() => {})
 }
 
 // ── API key persistence ──
@@ -244,6 +272,8 @@ async function saveApiKey() {
   apiKeyInput.value = ''
   showKeyInput.value = false
   flashStatus('API key saved.')
+  if (listen.value === 'on') api.startRealtimeSession({ apiKey: value }).catch(() => {}) // reconnects with the new key
+  else if (settings.autoListen) startListening()
 }
 
 // ── Window height follows the content ──
@@ -254,29 +284,34 @@ function syncWindowHeight() {
   if (rootEl.value) api.resizeHeight(rootEl.value.scrollHeight + 24)
 }
 
-// ── Live transcript scrolls to the newest words ──
+// ── Pending text scrolls to the newest words ──
 const liveTextEl = ref(null)
-watch(liveTranscript, async () => {
+watch(pendingText, async () => {
   await nextTick()
   if (liveTextEl.value) liveTextEl.value.scrollLeft = liveTextEl.value.scrollWidth
 })
 
 const unsubscribers = []
 
-onMounted(() => {
-  loadApiKey()
-  loadSettings()
-
+onMounted(async () => {
   unsubscribers.push(
-    api.onRealtimeTranscriptDelta(({ displayText }) => { liveTranscript.value = displayText || '' }),
-    api.onRealtimeTranscriptDone(({ transcript }) => { liveTranscript.value = transcript || '' }),
+    api.onRealtimePending(({ text, speaking: isSpeaking }) => {
+      pendingText.value = text || ''
+      speaking.value = !!isSpeaking
+    }),
+    api.onRealtimeStatus(({ state, message }) => {
+      connection.value = state
+      if (message && state !== 'connected') statusMsg.value = message
+    }),
     api.onRealtimeError(({ message }) => {
       console.warn('[realtime] error:', message)
-      if (isRecording.value) statusMsg.value = message
+      if (listen.value === 'on') statusMsg.value = message
     }),
-    api.onShortcutToggleRecord(() => (isRecording.value ? discardRecording() : startRecording())),
+    api.onShortcutToggleListen(() => toggleListening()),
     api.onShortcutAnswer(() => answerQuestion()),
     api.onShortcutScreen(() => analyzeScreen()),
+    api.onShortcutRegenerate(() => regenerate()),
+    api.onShortcutFollowUp((kind) => followUp(kind)),
     api.onWindowState((state) => { clickThrough.value = state.clickThrough })
   )
 
@@ -288,6 +323,9 @@ onMounted(() => {
   resizeObserver = new ResizeObserver(syncWindowHeight)
   resizeObserver.observe(rootEl.value)
   syncWindowHeight()
+
+  await Promise.all([loadApiKey(), loadSettings()])
+  if (settings.autoListen && apiKey.value) startListening()
 })
 
 onUnmounted(() => {
@@ -301,31 +339,32 @@ onUnmounted(() => {
   <div class="overlay-root" ref="rootEl">
     <div class="main-bar">
       <MainBar
-        :can-answer="canAnswer"
-        :can-analyze="!isBusy && !isRecording"
-        :can-paste="!isBusy"
+        :can-answer="phase === 'idle'"
+        :can-analyze="!isBusy"
+        :can-paste="phase === 'idle'"
         :paste-open="showPastePanel"
-        :is-recording="isRecording"
-        :recording-seconds="recorder.seconds.value"
+        :listen="listen"
+        :connection="connection"
         :level="recorder.level.value"
-        :has-history="answer.history.value.length > 0"
+        :has-pending="!!pendingText"
+        :has-history="answer.exchangeCount.value > 0"
         :settings-open="showSettings"
         :click-through="clickThrough"
         @answer="answerQuestion"
         @analyze="analyzeScreen"
         @toggle-paste="togglePanel('paste')"
         @toggle-settings="togglePanel('settings')"
-        @clear-audio="clearAudio"
+        @reset-block="resetBlock"
         @clear-session="clearSession"
-        @rec="isRecording ? answerQuestion() : startRecording()"
+        @toggle-listen="toggleListening"
         @quit="api.quitApp()"
       />
 
       <div class="status-msg" v-if="statusMsg">{{ statusMsg }}</div>
 
-      <div class="live-transcript" v-if="isRecording && liveTranscript">
-        <span class="live-dot"></span>
-        <div class="live-text" ref="liveTextEl">{{ liveTranscript }}</div>
+      <div class="live-transcript" v-if="pendingText || speaking">
+        <span class="live-dot" :class="{ idle: !speaking }"></span>
+        <div class="live-text" ref="liveTextEl">{{ pendingText || '…' }}</div>
       </div>
 
       <div class="key-row" v-if="showKeyInput">
@@ -348,8 +387,8 @@ onUnmounted(() => {
 
       <PastePanel
         v-if="showPastePanel"
-        :disabled="isBusy"
-        @submit="submitPasteText"
+        :disabled="phase !== 'idle'"
+        @submit="answerPastedText"
         @close="showPastePanel = false"
       />
     </div>
@@ -365,6 +404,7 @@ onUnmounted(() => {
       :can-stop="answer.streaming.value || phase === 'transcribing'"
       :can-follow-up="canFollowUp"
       @follow-up="followUp"
+      @regenerate="regenerate"
       @stop="stopAnswer"
       @close="closeAnswer"
     />
@@ -460,6 +500,12 @@ onUnmounted(() => {
   background: var(--red);
   flex-shrink: 0;
   animation: pulse-red 1.2s ease-in-out infinite;
+}
+
+/* Heard text waiting, interviewer not speaking right now */
+.live-dot.idle {
+  background: var(--text-hint);
+  animation: none;
 }
 
 .live-text {
